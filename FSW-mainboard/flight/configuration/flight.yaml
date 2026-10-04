@@ -1,0 +1,81 @@
+# Author: Perrin
+# Description: Flight configuration file, compiled as satellite_config module
+# Note: Add "_const: true" to any value that should be wrapped with const() in MicroPython
+
+# Commanding Task
+command:
+  EXIT_STARTUP_TIMEOUT:
+    value: 1800  # seconds, i.e., 30 minutes
+    _const: true
+
+  DETUMBLING_TIMEOUT_DURATION:
+    value: 18000  # seconds, i.e., 5 hours
+    _const: true
+
+  SKIP_DEPLOYMENT:
+    value: false  # Must be false for flight - deployment must execute
+
+  BURN_WIRE_TIMEOUT:
+    value: 5  # number of deployment attempts before forcing completion
+    _const: true
+
+# Time Processor Module
+time_processor:
+  time_reference: 
+    value: 1735689600  # Jan 1st 2025, 00:00:00 UTC
+    _const: false
+
+# Main Task
+main:
+  LOG_LEVEL:
+    value: "WARNING"
+
+# HAL Monitor Task
+hal_monitor:
+  REGULAR_REBOOT:
+    value: 86400 # seconds, i.e., 24 hours
+    _const: true
+
+# ARGUS ID is an argument in the build script for flight config (0 or 1)
+comms:
+  HB_PERIOD:
+    value: 60  # seconds, i.e., 60 seconds
+    _const: true
+  AUTH_ENABLED:
+    value: true
+  RADIO_FREQUENCY_MHZ:
+    value: 437.400  # MHz - radio operating frequency
+  AUTH_KEY_HEX:
+    value: "d6172b38acb7d2a28e21662f689d1d15ad78ccc888a9c7a78ef58cb61b0f1e32" # AUTH_KEY_D
+  SC_CALLSIGN:
+    value: "CT6ARG"
+  GS_CALLSIGN:
+    value: "CS5CEP"
+
+# Digipeater Task
+digipeater:
+  RX_QUEUE_MAX:
+    value: 5
+    _const: true
+
+hal:
+  ASIL0_EN:
+    value: false
+
+log:
+  LOG_DIR:
+    value: "/sd/sys_logs"
+  LOG_FILENAME:
+    value: "/sd/sys_logs/fsw.log"
+  LOG_FILE_MAX_BYTES:
+    value: 102400
+  LOG_FILE_BACKUP_COUNT:
+    value: 9
+  LOG_FILE_LEVEL:
+    value: "WARNING"
+
+# ADCS Task
+adcs:
+  CONTROLLER_MODE: 0
+  MAG_BIAS_UT: [0.0, 0.0, 0.0]
+  MAG_SCALE: [1.0, 1.0, 1.0]

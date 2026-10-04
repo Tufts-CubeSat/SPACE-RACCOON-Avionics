@@ -1,0 +1,1773 @@
+"""
+Onboard Data Handling (OBDH) Module
+
+======================
+
+The OBDH module serves as the backbone of the satellite's data management system, providing a robust and efficient interface
+for handling onboard persistent storage, inter-task communication, and telemetry.
+
+This module provides the main interface for the onboard data handling system with the following features:
+- Persistent storage management and single point of access for the onboard mass storage system (SD Card)
+- Enables data retrieval and system state restoration across reboot cycles.
+- Supports logging for flight software tasks with configurable intervals, storage limits, and buffering.
+- Manages telemetry (TM) and telecommand (TC) file generation for transmission.
+- Provides file exclusion, flagging, and deletion as an interface for the communication subsystem.
+- File exclusion, flagging, and deletion as interface for a communication subsystem
+- Handles binary encoding and decoding with configurable formats for efficient numerical and file data storage.
+- Facilitates seamless data sharing and communication between flight software components.
+- Binary encoding and decoding with configurable formats for compact and efficient storage of numerical and file data.
+- Easily adaptable to diverse mission requirements.
+
+Author: Ibrahima Sory Sow, Perrin Tong
+
+Data format (character: byte size):
+    "b": 1,  # byte
+    "B": 1,  # unsigned byte
+    "h": 2,  # short
+    "H": 2,  # unsigned short
+    "i": 4,  # int
+    "I": 4,  # unsigned int
+    "l": 4,  # long
+    "L": 4,  # unsigned long
+    "q": 8,  # long long
+    "Q": 8,  # unsigned long long
+    "f": 4,  # float
+    "d": 8,  # double
+
+"""
+
+import json
+import os
+import re
+import struct
+
+from core.logging import logger
+from core.time_processor import TimeProcessor as TPM
+from micropython import const
+
+try:
+    from typing import Any, List, Optional, Tuple
+except ImportError:
+    pass
+
+_HOME_PATH = "/sd"  # Default path for the SD card
+_CLOSED = const(20)
+_OPEN = const(21)
+_FILE_DATA_LIMIT = const(100000)
+_PACKET_HEADER_SIZE = const(2)  # 2 bytes for packet length header
+_MAX_PAYLOAD_SIZE = const(240)  # Maximum payload/data size in bytes (excludes header)
+_FIXED_PACKET_SIZE = const(_PACKET_HEADER_SIZE + _MAX_PAYLOAD_SIZE)  # Total packet size on disk: 242 bytes
+_DH_MAGIC_NUMBER = b"DHGEN"  # 5-byte magic number to identify data handler files
+_DH_FILE_HEADER_SIZE = const(5)  # Size of the file header (magic number)
+
+
+_PROCESS_CONFIG_FILENAME = ".data_process_configuration.json"
+_FILE_TAG_NAME = "file"  # Identifier for generic file processes
+
+
+class DataProcess:
+    """
+    Class for managing a single logging stream.
+
+    Attributes:
+        tag_name (str): The tag name for the file.
+        data_format (str): The format of the data to be written to the file.
+        persistent (bool): Whether the data should be logged to a file (default is True).
+        data_limit (int): The maximum number of data in bytes allowed in the file (default is 100kb).
+                        This attribute will automatically get updated based on the line bytesize.
+        new_config_file (bool): Whether to create a new configuration file (default is False).
+        write_interval (int): The interval of logs at which the data should be written to the file (default is 1).
+        write_interval_counter (int): The counter for the write interval.
+        circular_buffer_size (int): The size of the circular buffer for the files in the directory (default is 10).
+        retrieve_latest_data (bool): Whether to attempt to retrieve the latest data point and load it into the
+                                    internal buffer (default is True).
+        status (str): The status of the file ("CLOSED" or "OPEN").
+        file (file): The file object.
+        dir_path (str): The directory path for the file.
+        current_path (str): The current filename.
+        bytesize (int): The size of each new data line to be written to the file.
+    """
+
+    # For optimization purposes  (avoid creating a __dict__ and instantiate static memnory space for attributes)
+
+    __slots__ = (
+        "tag_name",
+        "data_format",
+        "persistent",
+        "data_limit",
+        "new_config_file",
+        "write_interval",
+        "write_interval_counter",
+        "circular_buffer_size",
+        "retrieve_latest_data",
+        "append_to_current",
+        "status",
+        "file",
+        "dir_path",
+        "current_path",
+        "bytesize",
+        "data_limit",
+        "last_data",
+        "delete_paths",
+        "excluded_paths",
+    )
+
+    _FORMAT = {
+        "b": 1,  # byte
+        "B": 1,  # unsigned byte
+        "h": 2,  # short
+        "H": 2,  # unsigned short
+        "i": 4,  # int
+        "I": 4,  # unsigned int
+        "l": 4,  # long
+        "L": 4,  # unsigned long
+        "q": 8,  # long long
+        "Q": 8,  # unsigned long long
+        "f": 4,  # float
+        "d": 8,  # double
+        "e": 2,  # half-precision float
+    }
+
+    def __init__(
+        self,
+        tag_name: str,
+        data_format: str,
+        persistent: bool = True,
+        data_limit: int = 100000,
+        write_interval: int = 1,
+        circular_buffer_size: int = 100,
+        retrieve_latest_data: bool = True,
+        append_to_current: bool = True,
+        new_config_file: bool = False,
+    ) -> None:
+        """
+        Initializes a DataProcess object.
+
+        Args:
+            tag_name (str): The tag name for the file (with no spaces or special characters).
+            data_format (str): The format of the data to be written to the file. e.g. 'iff', 'iif', 'fff', 'iii', etc.
+            persistent (bool, optional): Whether the file should be persistent or not (default is True).
+            data_limit (int, optional): The maximum number of data in bytes allowed in the file (default is 100kb).
+                                        This attribute will automatically get updated based on the line bytesize.
+            circular_buffer_size (int, optional): The size of the circular buffer for the files in
+                                        the directory (default is 10).
+            retrieve_latest_data (bool, optional): Whether to attempt to retrieve the latest data point (default is True)
+                                        and load it into the internal buffer.
+            append_to_current (bool, optional): Whether to attempt to append to the current file (default is True) instead
+                                                of creating a new file.
+            new_config_file (bool, optional): Whether to create a new configuration file (default is False).
+        """
+
+        self.tag_name = tag_name
+        self.file = None
+        self.persistent = persistent
+        self.write_interval = int(write_interval)
+        self.write_interval_counter = 0
+        self.circular_buffer_size = circular_buffer_size
+        self.retrieve_latest_data = retrieve_latest_data
+        self.append_to_current = append_to_current
+        self.data_limit = data_limit
+
+        self.current_path = None
+
+        # TODO Check formating e.g. 'iff', 'iif', 'fff', 'iii', etc. ~ done within compute_bytesize()
+        self.data_format = "<" + data_format
+        # Need to specify endianness to disable padding
+        # (https://stackoverflow.com/questions/47750056/python-struct-unpack-length-error/47750278#47750278)
+        self.bytesize = self.compute_bytesize(self.data_format)
+
+        self.last_data = None
+
+        self.delete_paths = []  # Paths that are flagged for deletion
+        self.excluded_paths = []  # Paths that are currently being transmitted
+
+        if self.persistent:
+            self.status = _CLOSED
+
+            self.dir_path = join_path(_HOME_PATH, tag_name)
+            self.create_folder()
+
+            if retrieve_latest_data:
+                # attempt to retrieve the latest data point and load it into the internal buffer
+                self.retrieve_last_data_from_latest_file()
+
+            self.initialize_current_file()
+
+            config_file_path = join_path(self.dir_path, _PROCESS_CONFIG_FILENAME)
+            if not path_exist(config_file_path) or new_config_file:
+                config_data = {
+                    "data_format": self.data_format[1:],  # remove the < character
+                    "data_limit": data_limit,
+                    "write_interval": write_interval,
+                    "retrieve_latest_data": retrieve_latest_data,
+                    "append_to_current": append_to_current,
+                }
+                with open(config_file_path, "w") as config_file:
+                    json.dump(config_data, config_file)
+
+    def create_folder(self) -> None:
+        """
+        Creates a folder for the file if it doesn't already exist.
+        """
+        if not path_exist(self.dir_path):
+            try:
+                os.mkdir(self.dir_path)
+                logger.info(f"Folder {self.dir_path} created successfully.")
+            except OSError as e:
+                logger.critical(f"Error creating folder: {e}")
+        else:
+            logger.debug("Folder already exists.")
+
+    @classmethod
+    def compute_bytesize(cls, data_format: str) -> int:
+        """
+        Compute the bytesize for each new data line to be written to the file.
+
+        Args:
+            data_format (str): The format of the data.
+
+        Returns:
+            int: The bytesize of each new data line.
+        """
+        b_size = 0
+        for c in data_format[1:]:  # do not include the endianness character
+            if c not in cls._FORMAT:
+                raise ValueError(f"Invalid format character '{c}'")
+            b_size += cls._FORMAT[c]
+        return b_size
+
+    def log(self, data: List) -> None:
+        """
+        Logs the given data (eventually also to a file if persistent = True).
+
+        Args:
+            data (List): The data to be logged.
+
+        Returns:
+            None
+        """
+
+        self.last_data = data
+
+        if self.persistent and not DataHandler.REBOOT_IN_PROGRESS:
+            self.resolve_current_file()
+            self.write_interval_counter += 1
+
+            if self.write_interval_counter >= self.write_interval:
+                try:
+                    bin_data = struct.pack(self.data_format, *data)
+                    self.file.write(bin_data)
+                    self.file.flush()  # Flush immediately
+                    self.write_interval_counter = 0
+                except (ValueError, OSError) as e:
+                    # File may be deinitialized after peripheral reboot
+                    # Force status to closed so next call will reopen
+                    logger.error(f"Error writing to {self.tag_name}: {e}")
+                    self.file = None
+                    self.status = _CLOSED
+
+    def get_latest_data(self) -> Optional[List]:
+        """
+        Returns the latest data point.
+
+        If a data point has been logged, it returns the last data point.
+        If no data point has been logged yet, it returns None.
+
+        Returns:
+            The latest data point or None if no data point is available yet.
+        """
+        if self.last_data is not None:
+            return self.last_data
+        else:
+            logger.warning(f"No latest data {self.tag_name}")
+            return None
+
+    def clear_latest_data(self) -> bool:
+        """
+        Clears the latest data point.
+        """
+        self.last_data = None
+
+    def data_available(self) -> bool:
+        """
+        Returns whether data is available in the internal buffer (latest).
+        If data is  not available, it is either because nothing has been logged yet
+        or the data has been cleared.
+        """
+        return self.last_data is not None
+
+    def resolve_current_file(self) -> None:
+        """
+        Resolve the current file to write to.
+        """
+        if self.status == _CLOSED:
+            self.current_path = self.create_new_path()
+            self.open()
+        elif self.status == _OPEN:
+            current_file_size = self.get_current_file_size()
+            if current_file_size >= self.data_limit:
+                self.close()
+                self.current_path = self.create_new_path()
+                self.open()
+
+    def create_new_path(self) -> str:
+        """
+        Create a new filename for the current file process.
+
+        Returns:
+            str: The new filename.
+        """
+        # Keeping the tag name in the filename for identification in debugging
+        return join_path(self.dir_path, self.tag_name) + "_" + str(TPM.time()) + ".bin"
+
+    def try_to_reuse_latest_file(self) -> bool:
+        """
+        Attempt to reuse the latest file in the directory.
+        Returns True if the file was successfully reused, False otherwise.
+        """
+        if not self.persistent:
+            return False  # Non-persistent data processes don't have files
+
+        latest_file = self._get_latest_file()
+        if latest_file is not None:
+            try:
+                # Force close any existing file handle (may be deinitialized after peripheral reboot)
+                if self.file is not None:
+                    try:
+                        self.file.close()
+                    except Exception as e:
+                        self.log_info(f"Error closing file: {e}, file already closed/deinitialized.")
+                        pass  # Ignore errors if file already closed/deinitialized
+                    self.file = None
+
+                self.current_path = latest_file
+                self.status = _CLOSED  # Ensure status is closed before opening
+                self.open()
+                return True
+            except Exception as e:
+                logger.error(f"Error reusing latest file {latest_file}: {e}")
+                return False
+        else:
+            return False
+
+    def initialize_current_file(self) -> None:
+        """
+        Initialize the current file path, either by reusing the latest file or creating a new one.
+        """
+        if not self.append_to_current or not self.try_to_reuse_latest_file():
+            self.current_path = self.create_new_path()
+        # else: # for debugging
+        #    print("Reusing latest file ", self.current_path)
+
+    def retrieve_last_data_from_latest_file(self) -> bool:
+        """
+        Retrieve the last data point from the latest file in the directory.
+        Returns True if the data was successfully retrieved, False otherwise.
+        """
+        latest_file = self._get_latest_file()
+        if latest_file is not None:
+            try:
+                with open(latest_file, "rb") as file:
+                    SEEK_END = 0
+                    file.seek(-self.bytesize, SEEK_END)
+                    cr = file.read(self.bytesize)
+                    if len(cr) != self.bytesize:  # Handle incomplete data
+                        return False
+                    self.last_data = struct.unpack(self.data_format, cr)
+                    return True
+            except Exception as e:
+                logger.warning(f"Error reading file {latest_file}: {e}")
+                # might want to delete the file in case of corruption if we don't have mechanism to "repair" it
+                return False
+        else:
+            return False
+
+    def open(self) -> None:
+        """
+        Open the file for writing.
+        """
+        if self.status == _CLOSED:
+            self.file = open(self.current_path, "ab+")
+            self.status = _OPEN
+        else:
+            logger.info("File is already open.")
+
+    def close(self) -> None:
+        """
+        Close the file.
+        """
+        if not self.persistent:
+            return  # Non-persistent data processes don't have files to close
+
+        if self.file is not None:
+            try:
+                self.file.close()
+            except Exception as e:
+                self.log_info(f"Error closing file: {e}, file already closed/deinitialized.")
+        if self.status == _OPEN:
+            self.status = _CLOSED
+
+    def _get_latest_file(self) -> Optional[str]:
+        """
+        Helper functions that returns the path of the latest file in the directory if it exists.
+        If no file is available, the function returns None.
+        """
+        files = self.get_sorted_file_list()
+        if len(files) > 1:  # Ignore process configuration file
+            file = files[-1]
+            if file == _PROCESS_CONFIG_FILENAME:
+                file = files[-2]
+            path = join_path(self.dir_path, file)
+            return path
+        else:
+            return None
+
+    def request_TM_path(self, latest: bool = False, file_time=None) -> Optional[str]:
+        """
+        Returns the path of a designated file available for transmission.
+        If no file is available, the function returns None.
+
+        The function store the file path to be excluded in a separate list.
+        Once fully transmitted, notify_TM_path() must be called to remove the file from the exclusion list
+        and prepare for deletion.
+        """
+        files = self.get_sorted_file_list()
+
+        # remove process configuration file, it will always be the first one
+        if len(files) == 0:
+            logger.warning("No process configuration file.")
+            return None
+        elif len(files) == 1:
+            # Only the process configuration file is present
+            logger.warning("Only process configuration file present.")
+            return None
+        elif len(files) > 1:
+            files = files[1:]  # Ignore process configuration file
+            transmit_file = None
+            if latest:
+                transmit_file = files[-1]
+            elif file_time is not None:
+                result_file = get_closest_file_time(file_time, files)
+                transmit_file = result_file if result_file is not None else files[0]
+            else:  # oldest file
+                transmit_file = files[0]
+
+            tm_path = join_path(self.dir_path, transmit_file)
+            if tm_path == self.current_path:
+                self.close()
+                self.resolve_current_file()
+
+            self.excluded_paths.append(tm_path)
+            return tm_path
+        else:
+            return None
+
+    def notify_TM_path(self, path: str) -> None:
+        """
+        Acknowledge the transmission of the file.
+        The file is then removed from the excluded list and added to the deletion list.
+        """
+        if path in self.excluded_paths:
+            self.excluded_paths.remove(path)
+            self.delete_paths.append(path)
+            # TODO handle case where comms transmitted a file it wasn't suposed to
+        else:
+            logger.info("No file to acknowledge.")
+
+    def clean_up(self) -> None:
+        """
+        Clean up the files that have been marked for deletion.
+        """
+        for d_path in self.delete_paths[:]:  # IMPORTANT: Iterate over a COPY of the list
+            # shouldn't iterate over the same list we're removing from
+            if path_exist(d_path):
+                os.remove(d_path)
+            else:
+                # TODO - log error, use exception handling instead
+                logger.critical(f"File {d_path} does not exist.")
+            self.delete_paths.remove(d_path)
+
+    def check_circular_buffer(self) -> None:
+        """
+        Checks the circular buffer for the number of files and manages the deletion of the oldest files if necessary.
+
+        This method performs the following steps:
+        1. Retrieves the list of files in the directory, excluding the process configuration file.
+        2. Compares the number of files against the circular buffer size, adjusted for excluded and delete paths.
+        3. If the number of files exceeds the circular buffer size, it marks the oldest file for deletion,
+           ignoring files in excluded_paths and delete_paths.
+
+        Note:
+            - The method updates the delete_paths list with the files marked for deletion.
+            - The actual deletion of files is not performed by this method.
+
+        Returns:
+            None
+        """
+        if self.persistent:
+            files = self.get_sorted_file_list()[1:]  # Ignore process configuration file
+
+            # Don't count currently open file (if any) since it's not complete yet
+            completed_file_count = len(files)
+            if self.status == _OPEN and self.current_path:
+                # Current file exists in the list but isn't complete, don't count it
+                completed_file_count -= 1
+
+            # Actual overflow of the buffer
+            diff = completed_file_count - (self.circular_buffer_size + len(self.excluded_paths) + len(self.delete_paths))
+            mark_counter = 0
+            if diff > 0:
+                # diff files to mark for deletion
+                for file in files:
+                    file = join_path(self.dir_path, file)
+                    if file not in self.excluded_paths and file not in self.delete_paths and file != self.current_path:
+                        self.delete_paths.append(file)  # mark for deletion
+                        mark_counter += 1
+                    if mark_counter == diff:
+                        break
+
+    def get_sorted_file_list(self) -> List[str]:
+        """
+        Returns a list of all files in the directory.
+
+        Returns:
+            A list of filenames.
+        """
+        return sorted(os.listdir(self.dir_path))
+
+    def get_storage_info(self) -> Tuple[int, int]:
+        """
+        Returns storage information for the current file process which includes:
+        - Number of files in the directory
+        - Total directory size in bytes
+
+        Returns:
+            A tuple containing the number of files and the total directory size.
+        """
+        files = os.listdir(self.dir_path)
+        if self.get_current_file_size() is not None:
+            total_size = (len(files) - 2) * self.data_limit + self.get_current_file_size()
+        else:
+            total_size = 0
+
+        return (len(files) - 1), total_size
+
+    def get_current_file_size(self) -> Optional[int]:
+        """
+        Get the current size of the file.
+
+        Returns:
+            Optional[int]: The size of the file in bytes, or None if there was an error or the file does not exist.
+        """
+        if path_exist(self.current_path):
+            try:
+                file_stats = os.stat(self.current_path)
+                filesize = file_stats[6]  # size of the file in bytes
+                return filesize
+            except OSError as e:
+                logger.error(f"Error getting file size: {e}")
+                return None
+        else:
+            # TODO handle case where file does not exist
+            logger.warning(f"File {self.current_path} does not exist.")
+            return None
+
+    # DEBUG ONLY
+    def read_current_file(self) -> List[Tuple[Any, ...]]:
+        """
+        Reads the content of the current file.
+
+        Returns:
+            A list of tuples representing the content of the file.
+            Each tuple contains the unpacked data from a line in the file.
+
+        Raises:
+            FileNotFoundError: If the file does not exist.
+        """
+        self.close()
+        if self.status == _CLOSED:
+            # TODO file not existing
+            with open(self.current_path, "rb") as file:
+                content = []
+                # TODO add max iter (max lines to read from file)
+                while True:
+                    cr = file.read(self.bytesize)
+                    if not cr:
+                        break
+                    content.append(struct.unpack(self.data_format, cr))
+                return content
+        else:
+            logger.warning(f"Can't read {self.current_path}: File is not closed!")
+
+
+class FileProcess(DataProcess):
+    """
+    Class for managing arbitrary file data (images, audio, binary blobs, etc.).
+
+    Files are stored as fixed-length packet containers with the following format:
+    [packet_len (2 bytes)][packet_data (variable)][padding to _FIXED_PACKET_SIZE]...
+
+    This allows:
+    - O(1) direct access to any packet by index (no scanning required)
+    - O(1) packet count calculation from file size
+    - Multiple packets in a single binary file
+    - Easy extraction of individual packets for transmission
+    - Reconstruction of original files on ground station
+    - Efficient storage with predictable file sizes
+
+    Each packet is exactly _FIXED_PACKET_SIZE bytes (default 242), where:
+    - First 2 bytes: actual data length (big-endian)
+    - Next N bytes: actual packet data
+    - Remaining bytes: zero padding
+
+    Attributes:
+        tag_name (str): The tag name for the file.
+        file_extension (str): The file extension (e.g., 'jpg', 'png', 'wav', 'bin').
+        data_limit (int): Maximum file size in bytes (default 100KB).
+        circular_buffer_size (int): Number of files to keep in circular buffer (default 20).
+        buffer_size (int): Size of write buffer for efficient SD card writes (default 512 bytes).
+        packet_count (int): Number of packets stored in the current file.
+    """
+
+    def __init__(
+        self,
+        tag_name: str,
+        file_extension: str = "bin",
+        data_limit: int = _FILE_DATA_LIMIT,
+        circular_buffer_size: int = 20,
+        buffer_size: int = 512,
+    ):
+        """
+        Initializes a FileProcess object.
+
+        Args:
+            tag_name (str): The tag name for the file process.
+            file_extension (str, optional): File extension without dot (default is 'bin').
+            data_limit (int, optional): Maximum file size in bytes (default is 100KB).
+            circular_buffer_size (int, optional): Number of files in circular buffer (default is 20).
+            buffer_size (int, optional): Write buffer size in bytes (default is 512).
+        """
+        self.tag_name = tag_name
+        self.file = None
+        self.file_extension = file_extension
+
+        self.status = _CLOSED
+        self.persistent = True
+
+        self.dir_path = join_path(_HOME_PATH, self.tag_name)
+        self.create_folder()
+
+        self.data_limit = data_limit
+
+        self.current_path = self.create_new_path()
+        self.delete_paths = []  # Paths that are flagged for deletion
+        self.excluded_paths = []  # Paths that are currently being transmitted
+        self.circular_buffer_size = circular_buffer_size
+        self.buffer_size = buffer_size
+        self.file_buf = bytearray(self.buffer_size)  # Pre-allocated static buffer for file writes
+        self.file_buf_index = 0  # index to track position in buffer
+        self.packet_count = 0  # Number of packets in current file
+        self.file_header_written = False  # Track if magic number has been written
+
+        config_file_path = join_path(self.dir_path, _PROCESS_CONFIG_FILENAME)
+        if not path_exist(config_file_path):
+            config_data = {
+                _FILE_TAG_NAME: True,
+                "file_extension": self.file_extension,
+                "data_limit": data_limit,
+                "circular_buffer_size": circular_buffer_size,
+                "buffer_size": buffer_size,
+            }
+            with open(config_file_path, "w") as config_file:
+                json.dump(config_data, config_file)
+
+    def resolve_current_file(self) -> None:
+        """
+        Resolve the current file to write to.
+        """
+        if self.status == _CLOSED:
+            self.current_path = self.create_new_path()
+            self.packet_count = 0
+            self.file_header_written = False
+            self.open()
+        elif self.status == _OPEN:
+            current_file_size = self.get_current_file_size()
+            if current_file_size >= self.data_limit:
+                self.close()
+                self.current_path = self.create_new_path()
+                self.packet_count = 0
+                self.file_header_written = False
+                self.open()
+
+    def create_new_path(self) -> str:
+        """
+        Create a new filename for the file process.
+
+        Returns:
+            str: The new filename.
+        """
+        # Keeping the tag name in the filename for identification
+        return join_path(self.dir_path, self.tag_name) + "_" + str(TPM.time()) + "." + self.file_extension
+
+    def log(self, data: bytearray) -> None:
+        """
+        Logs the given file data as a fixed-length packet with a 2-byte length header.
+        Format: [packet_len (2 bytes, big-endian)][packet_data (up to 240 bytes)][padding to _FIXED_PACKET_SIZE]
+
+        The packet is padded to _FIXED_PACKET_SIZE bytes (242) for constant-time access.
+        Actual data length is stored in the header for extraction without padding.
+        Maximum payload size is 240 bytes.
+
+        The first time log() is called on a new file, a 5-byte magic number is written first
+        to identify this as a data handler formatted file.
+
+        Args:
+            data (bytearray): The bytes of data to be logged as a packet.
+
+        Returns:
+            None
+        """
+        packet_len = len(data)
+
+        if packet_len > _MAX_PAYLOAD_SIZE:
+            logger.error(f"Packet too large: {packet_len} bytes (max {_MAX_PAYLOAD_SIZE})")
+            return
+
+        packet_header = packet_len.to_bytes(2, "big")
+        packet_data = bytearray(_FIXED_PACKET_SIZE)
+        packet_data[0:2] = packet_header
+        packet_data[2 : 2 + packet_len] = data
+
+        # Skip logging if reboot is in progress
+        if DataHandler.REBOOT_IN_PROGRESS:
+            return
+
+        if not DataHandler.SD_ERROR_FLAG:
+            # Ensure file is open before writing
+            self.resolve_current_file()
+
+            try:
+                # Write magic number header on first write to new file
+                if not self.file_header_written:
+                    self.file.write(_DH_MAGIC_NUMBER)
+                    self.file.flush()
+                    self.file_header_written = True
+
+                # Add to file buffer and transmit only when buffer is full
+                data_len = len(packet_data)
+                data_offset = 0  # Keeps track of processed data
+
+                while data_offset < data_len:
+                    space_remaining = self.buffer_size - self.file_buf_index
+                    chunk_size = min(data_len - data_offset, space_remaining)  # Fill as much as possible
+
+                    # Copy data into buffer
+                    self.file_buf[self.file_buf_index : self.file_buf_index + chunk_size] = packet_data[
+                        data_offset : data_offset + chunk_size
+                    ]
+                    self.file_buf_index += chunk_size
+                    data_offset += chunk_size  # Move data offset
+
+                    if self.file_buf_index == self.buffer_size:
+                        # Buffer is full, write to SD card
+                        self.file.write(self.file_buf[: self.buffer_size])  # Write full buffer block
+                        self.file.flush()
+                        self.file_buf_index = 0  # Reset buffer index
+            except (ValueError, OSError) as e:
+                # File may be deinitialized after peripheral reboot
+                # Force status to closed so next call will reopen
+                logger.error(f"Error writing to {self.tag_name}: {e}")
+                self.file = None
+                self.status = _CLOSED
+                self.file_header_written = False
+                self.file_buf_index = 0
+
+        else:
+            # Transmit each time without adding to a buf
+            try:
+                self.resolve_current_file()
+                self.last_data = packet_data
+
+                self.file.write(packet_data)
+                self.file.flush()
+            except (ValueError, OSError) as e:
+                # File may be deinitialized after peripheral reboot
+                logger.error(f"Error writing to {self.tag_name}: {e}")
+                self.file = None
+                self.status = _CLOSED
+
+        self.packet_count += 1
+
+    def request_TM_path(self, latest: bool = False, file_time=None) -> Optional[str]:
+        """
+        MODIFIED FOR FILES as we need complete files to be transmitted.
+
+        Returns the path of a designated file available for transmission.
+        If no file is available, the function returns None.
+
+        The function store the file path to be excluded in a separate list.
+        Once fully transmitted, notify_TM_path() must be called to remove the file from the exclusion list
+        and prepare for deletion.
+        """
+        files = self.get_sorted_file_list()
+
+        # remove process configuration file, it will always be the first one
+        if len(files) == 0:
+            logger.warning("No process configuration file.")
+            return None
+        elif len(files) == 1:
+            # Only the process configuration file is present
+            logger.warning("Only process configuration file present.")
+            return None
+        elif len(files) > 1:
+            files = files[1:]  # Ignore process configuration file
+            transmit_file = None
+            if latest:
+                transmit_file = files[-1]
+            elif file_time is not None:
+                result_file = get_closest_file_time(file_time, files)
+                transmit_file = result_file if result_file is not None else files[0]
+            else:  # oldest file
+                transmit_file = files[0]
+
+            tm_path = join_path(self.dir_path, transmit_file)
+
+            if tm_path == self.current_path or not path_exist(tm_path):
+                return None
+
+            self.excluded_paths.append(tm_path)
+            return tm_path
+        else:
+            return None
+
+    def get_packet_count(self, filepath: str = None) -> int:
+        """
+        Get the number of packets in a file using O(1) calculation.
+
+        For .bin files created by data handler (with magic number):
+            packet count = (filesize - 5) // _FIXED_PACKET_SIZE (242 bytes per packet)
+        For other files (raw data):
+            packet count = ceil(filesize / _MAX_PAYLOAD_SIZE) (240 bytes per chunk)
+
+        Args:
+            filepath (str, optional): Path to the file. If None, uses current file.
+
+        Returns:
+            int: Number of packets in the file, or 0 if error.
+        """
+        if filepath is None:
+            filepath = self.current_path
+
+        if not path_exist(filepath):
+            logger.warning(f"File does not exist: {filepath}")
+            return 0
+
+        try:
+            file_stats = os.stat(filepath)
+            filesize = file_stats[6]  # size of the file in bytes
+
+            # Check if this is a .bin file with data handler magic number
+            if filepath.endswith(".bin"):
+                with open(filepath, "rb") as f:
+                    magic = f.read(_DH_FILE_HEADER_SIZE)
+                    if magic == _DH_MAGIC_NUMBER:
+                        # Data handler formatted file
+                        data_size = filesize - _DH_FILE_HEADER_SIZE
+                        packet_count = data_size // _FIXED_PACKET_SIZE
+                        return packet_count
+
+            # Raw file without magic number - treat as raw data
+            packet_count = (filesize + _MAX_PAYLOAD_SIZE - 1) // _MAX_PAYLOAD_SIZE  # Ceiling division
+            return packet_count
+
+        except Exception as e:
+            logger.error(f"Error counting packets in {filepath}: {e}")
+            return 0
+
+    def get_packet(self, filepath: str, packet_index: int) -> Optional[Tuple[int, bytearray]]:
+        """
+        Extract a specific packet from a file by index using O(1) direct access.
+
+        For .bin files created by data handler (with magic number):
+            - Packets are stored with 2-byte headers at fixed 242-byte intervals after the magic number
+            - Returns payload data without header or padding
+
+        For other files (raw data like .jpg):
+            - Reads 240-byte chunks directly
+            - Returns raw data as-is
+
+        Args:
+            filepath (str): Path to the file.
+            packet_index (int): Zero-based index of the packet to extract.
+
+        Returns:
+            Optional[Tuple[int, bytearray]]: The packet length and data, or None if not found.
+        """
+        if not path_exist(filepath):
+            logger.warning(f"File does not exist: {filepath}")
+            return None
+
+        try:
+            # Check if this is a .bin file with data handler magic number
+            is_dh_formatted = False
+            if filepath.endswith(".bin"):
+                with open(filepath, "rb") as f:
+                    magic = f.read(_DH_FILE_HEADER_SIZE)
+                    if magic == _DH_MAGIC_NUMBER:
+                        is_dh_formatted = True
+
+            if is_dh_formatted:
+                # Data handler formatted file - read with headers
+                packet_offset = packet_index * _FIXED_PACKET_SIZE
+
+                with open(filepath, "rb") as f:
+                    f.seek(packet_offset)
+                    packet_data = f.read(_FIXED_PACKET_SIZE)
+
+                    if len(packet_data) < _PACKET_HEADER_SIZE:
+                        logger.warning(f"Packet index {packet_index} not found in {filepath}")
+                        return None
+
+                    # Extract data length from header
+                    packet_len = int.from_bytes(packet_data[0:2], "big")
+
+                    if packet_len == 0 or packet_len > _MAX_PAYLOAD_SIZE:
+                        logger.error(f"Invalid packet length {packet_len} at index {packet_index}")
+                        return None
+
+                    # Return payload without header and padding
+                    return packet_len, bytearray(packet_data[2 : 2 + packet_len])
+            else:
+                # Raw file - read _MAX_PAYLOAD_SIZE chunks
+                raw_offset = packet_index * _MAX_PAYLOAD_SIZE
+
+                with open(filepath, "rb") as f:
+                    f.seek(raw_offset)
+                    raw_data = f.read(_MAX_PAYLOAD_SIZE)
+
+                    if len(raw_data) == 0:
+                        logger.warning(f"No data at packet index {packet_index} in {filepath}")
+                        return None
+
+                    actual_len = len(raw_data)
+                    return actual_len, bytearray(raw_data)
+
+        except Exception as e:
+            logger.error(f"Error extracting packet from {filepath}: {e}")
+            return None
+
+    def file_completed(self):
+        """
+        Closes the current file without creating a new one.
+        Flushes any remaining buffered data before closing.
+        A new file will be created automatically when log() is called next.
+
+        Returns:
+            None
+        """
+        # Flush any remaining data in the buffer
+        if self.file_buf_index > 0 and self.status == _OPEN:
+            self.file.write(self.file_buf[: self.file_buf_index])
+            self.file.flush()
+            self.file_buf_index = 0
+
+        self.close()
+
+
+class DataHandler:
+    """
+    Managing class for all data processes and the SD card.
+
+    Note: If the same SPI bus is shared with other peripherals, the SD card must be initialized
+    before accessing any other peripheral on the bus.
+    Failure to do so can prevent the SD card from being recognized until it is powered off or re-inserted.
+    """
+
+    _SD_SCANNED = False
+    _SD_USAGE = 0
+    SD_ERROR_FLAG = False
+    REBOOT_IN_PROGRESS = False  # Flag to prevent logging during peripheral reboot
+
+    # Keep track of all file processes
+    data_process_registry = dict()
+
+    def __can_write_to_path(path: str) -> bool:
+        """
+        Check if the given path is writable by attempting to create a temporary file.
+
+        Args:
+            path (str): The path to check.
+
+        Returns:
+            bool: True if the path is writable, False otherwise.
+        """
+        test_file = join_path(path, ".write_test")
+        try:
+            with open(test_file, "w") as f:
+                f.write("test")
+            return True
+        except OSError:
+            return False
+        finally:
+            if path_exist(test_file):
+                try:
+                    os.remove(test_file)
+                except Exception:
+                    pass
+
+    @classmethod
+    def scan_SD_card(cls) -> None:
+        """
+        Scans the SD card for configuration files and registers data processes.
+
+        This method scans the SD card for directories and checks if each directory contains a configuration file.
+        If a configuration file is found, it reads the data format and line limit from the file and registers
+        a data process with the specified parameters.
+
+        If a file configuration is found, it registers a file process with the specified data format.
+
+        Returns:
+            None
+
+        Example:
+            DataHandler.scan_SD_card()
+        """
+        if not cls.__can_write_to_path(_HOME_PATH):
+            # The SD card path has an issue
+            cls.SD_ERROR_FLAG = True
+        else:
+            cls.SD_ERROR_FLAG = False
+            directories = cls.list_directories()
+            for dir_name in directories:
+                config_file = join_path(_HOME_PATH, dir_name, _PROCESS_CONFIG_FILENAME)
+                if path_exist(config_file):
+                    with open(config_file, "r") as f:
+                        config_data = json.load(f)
+
+                        # Check for generic file process
+                        if _FILE_TAG_NAME in config_data:
+                            file_extension: str = config_data.get("file_extension", "bin")
+                            data_limit: int = config_data.get("data_limit", _FILE_DATA_LIMIT)
+                            circular_buffer_size: int = config_data.get("circular_buffer_size", 20)
+                            buffer_size: int = config_data.get("buffer_size", 512)
+                            cls.register_file_process(
+                                tag_name=dir_name,
+                                file_extension=file_extension,
+                                data_limit=data_limit,
+                                circular_buffer_size=circular_buffer_size,
+                                buffer_size=buffer_size,
+                            )
+                            continue
+
+                        # Standard data process
+                        data_format: str = config_data.get("data_format")
+                        data_limit: int = config_data.get("data_limit")
+                        write_interval: int = config_data.get("write_interval")
+                        retrieve_latest_data: bool = config_data.get("retrieve_latest_data")
+                        append_to_current: bool = config_data.get("append_to_current")
+                        if data_format and data_limit:
+                            cls.register_data_process(
+                                tag_name=dir_name,
+                                data_format=data_format,
+                                persistent=True,
+                                data_limit=data_limit,
+                                write_interval=write_interval,
+                                retrieve_latest_data=retrieve_latest_data,
+                                append_to_current=append_to_current,
+                            )
+        cls._SD_SCANNED = (
+            True  # Need this flag to be set to True for the rest to proceed, irrespective of an SD card failure or not
+        )
+
+    @classmethod
+    def SD_SCANNED(cls) -> bool:
+        """
+        Returns the status of the SD card scanning.
+
+        Returns:
+            bool: True if the SD card has been scanned, False otherwise.
+        """
+        return cls._SD_SCANNED
+
+    @classmethod
+    def register_data_process(
+        cls,
+        tag_name: str,
+        data_format: str,
+        persistent: bool,
+        data_limit: int = 100000,
+        write_interval: int = 1,
+        circular_buffer_size: int = 50,
+        retrieve_latest_data: bool = True,
+        append_to_current: bool = True,
+    ) -> None:
+        """
+        Register a data process with the given parameters.
+
+        Parameters:
+        - tag_name (str): The name of the data process.
+        - data_format (str): The format of the data.
+        - persistent (bool): Whether the data should be logged to a file.
+        - data_limit (int, optional): The maximum number of data lines to store. Defaults to 100000 bytes.
+        - write_interval (int, optional): The interval of logs at which the data should be written to the file. Defaults to 1.
+        - circular_buffer_size (int, optional): The size of the circular buffer for the files in the directory. Defaults to 10.
+        - retrieve_latest_data (bool, optional): Whether to attempt to retrieve the latest data point and load it into the
+        internal buffer. Defaults to True.
+        - append_to_current (bool, optional): Whether to attempt to append to the current file instead of creating a new file.
+        Defaults to True.
+
+        Raises:
+        - ValueError: If data_limit is not a positive integer.
+
+        Returns:
+        - None
+        """
+        if isinstance(data_limit, int) and data_limit > 0:
+            cls.data_process_registry[tag_name] = DataProcess(
+                tag_name,
+                data_format,
+                persistent=persistent if cls.SD_ERROR_FLAG is False else False,
+                data_limit=data_limit,
+                write_interval=write_interval,
+                circular_buffer_size=circular_buffer_size,
+                retrieve_latest_data=retrieve_latest_data,
+                append_to_current=append_to_current,
+            )
+            if cls.SD_ERROR_FLAG:
+                logger.warning(f"Data process {tag_name} not persistent due to SD card error.")
+        else:
+            raise ValueError("Data limit must be a positive integer.")
+
+    @classmethod
+    def register_file_process(
+        cls,
+        tag_name: str,
+        file_extension: str = "bin",
+        data_limit: int = _FILE_DATA_LIMIT,
+        circular_buffer_size: int = 20,
+        buffer_size: int = 512,
+    ) -> None:
+        """
+        Register a file process for arbitrary file types.
+
+        Parameters:
+        - tag_name (str): The name of the file process.
+        - file_extension (str, optional): File extension without dot (default is 'bin').
+        - data_limit (int, optional): Maximum file size in bytes (default is 100KB).
+        - circular_buffer_size (int, optional): Number of files in circular buffer (default is 20).
+        - buffer_size (int, optional): Write buffer size in bytes (default is 512).
+
+        Returns:
+        - None
+        """
+        try:
+            cls.data_process_registry[tag_name] = FileProcess(
+                tag_name=tag_name,
+                file_extension=file_extension,
+                data_limit=data_limit,
+                circular_buffer_size=circular_buffer_size,
+                buffer_size=buffer_size,
+            )
+        except Exception as e:
+            logger.error(f"Failed to register file process '{tag_name}': {e}")
+            if cls.SD_ERROR_FLAG:
+                logger.warning(f"File process {tag_name} not registered due to SD card error.")
+
+    @classmethod
+    def log_data(cls, tag_name: str, data: List) -> None:
+        """
+        Logs the provided data using the specified tag name.
+
+        Parameters:
+        - tag_name (str): The name of data process to associate with the logged data.
+        - data (List): The data to be logged.
+
+        Raises:
+        - KeyError: If the provided tag name is not registered in the data process registry.
+
+        Returns:
+        - None
+        """
+        try:
+            if tag_name in cls.data_process_registry:
+                cls.data_process_registry[tag_name].log(data)
+            else:
+                raise KeyError(f"Data process {tag_name} not registered!")
+        except KeyError as e:
+            logger.critical(f"Error: {e}")
+
+    @classmethod
+    def log_file(cls, tag_name: str, data: bytearray) -> None:
+        """
+        Logs the provided file data (images, audio, binary blobs, etc.).
+
+        Parameters:
+        - tag_name (str): The name of file process to associate with the logged data.
+        - data (bytearray): The file data to be logged.
+
+        Raises:
+        - KeyError: If the provided tag name is not registered in the data process registry.
+
+        Returns:
+        - None
+        """
+        try:
+            if tag_name in cls.data_process_registry:
+                cls.data_process_registry[tag_name].log(data)
+            else:
+                raise KeyError("File process not registered!")
+        except KeyError as e:
+            logger.critical(f"Error: {e}")
+
+    @classmethod
+    def file_completed(cls, tag_name: str) -> None:
+        """
+        Closes the current file and resolves it, to prepare for the next file.
+
+        Parameters:
+        - tag_name (str): The name of the file process.
+
+        Returns:
+            None
+        """
+        try:
+            if tag_name in cls.data_process_registry:
+                if hasattr(cls.data_process_registry[tag_name], "file_completed"):
+                    cls.data_process_registry[tag_name].file_completed()
+                else:
+                    logger.warning(f"Process {tag_name} does not support file_completed()")
+            else:
+                raise KeyError("File process not registered!")
+        except KeyError as e:
+            logger.critical(f"Error: {e}")
+
+    @classmethod
+    def get_latest_data(cls, tag_name: str):
+        """
+        Returns the latest data point for the specified data process.
+
+        Parameters:
+        - tag_name (str): The name of the data process.
+
+        Returns:
+        - The latest data point for the specified data process or None if the data process does not exist.
+        """
+        if cls._check_tag_name(tag_name):
+            return cls.data_process_registry[tag_name].get_latest_data()
+        else:
+            return None
+
+    @classmethod
+    def clear_latest_data(cls, tag_name: str) -> bool:
+        """
+        Clears the latest data point for the specified data process.
+
+        Parameters:
+        - tag_name (str): The name of the data process.
+
+        Returns True if the latest data point was cleared, False otherwise
+        (and if a tag_name associated to a data process does not exist).
+        """
+        if cls._check_tag_name(tag_name):
+            return cls.data_process_registry[tag_name].clear_latest_data()
+        else:
+            return False
+
+    @classmethod
+    def data_available(cls, tag_name: str) -> bool:
+        """
+        Returns whether data is available in the internal buffer (latest) for the specified data process.
+        If data is not available, it is either because nothing has been logged yet or the data has been cleared.
+
+        Parameters:
+        - tag_name (str): The name of the data process.
+
+        Returns:
+        - bool: True if data is available, False otherwise (and if a tag_name associated to a data process does not exist).
+        """
+        if cls._check_tag_name(tag_name):
+            return cls.data_process_registry[tag_name].data_available()
+        else:
+            return False
+
+    @classmethod
+    def check_SD_status(cls) -> bool:
+        """
+        Returns the status of the SD card.
+
+        Returns:
+        - bool: True if the SD card is functioning correctly, False otherwise.
+        """
+        return not cls.SD_ERROR_FLAG
+
+    @classmethod
+    def list_directories(cls) -> List[str]:
+        """
+        Returns a list of directories in the SD card path.
+
+        Returns:
+            A list of directory names.
+
+        Example:
+            directories = DataHandler.list_directories()
+        """
+        return os.listdir(_HOME_PATH)
+
+    # DEBUG ONLY
+    @classmethod
+    def get_data_process(cls, tag_name: str) -> DataProcess:
+        """
+        Returns the data process object associated with the specified tag name.
+
+        Parameters:
+            tag_name (str): The name of the data process.
+
+        Raises:
+            KeyError: If the provided tag name is not registered in the data process registry.
+
+        Returns:
+            The data process object.
+
+        Example:
+            process = DataHandler.get_data_process('tag_name')
+        """
+        return cls.data_process_registry[tag_name]
+
+    @classmethod
+    def graceful_shutdown(cls) -> bool:
+        """
+        WARNING: should not be used unless for self-driven reboot.
+        Gracefully shuts down all data processes by closing their files.
+        Sets REBOOT_IN_PROGRESS flag to prevent new log attempts during reboot.
+
+        Returns:
+            Bool
+        """
+        cls.REBOOT_IN_PROGRESS = True  # Block all logging during reboot
+        try:
+            for tag_name in cls.data_process_registry:
+                try:
+                    cls.data_process_registry[tag_name].close()
+                except Exception as e:
+                    logger.error(f"Error closing {tag_name}: {e}")
+            return True
+        except Exception as e:
+            logger.error(f"Error in graceful_shutdown: {e}")
+            return False
+
+    @classmethod
+    def restore_data_process_files(cls) -> bool:
+        """
+        Restores the data process files by reinitializing them.
+        Clears REBOOT_IN_PROGRESS flag to allow logging to resume.
+
+        Returns:
+            Bool
+        """
+        try:
+            for tag_name in cls.data_process_registry:
+                try:
+                    cls.data_process_registry[tag_name].try_to_reuse_latest_file()
+                except Exception as e:
+                    logger.error(f"Error restoring {tag_name}: {e}")
+            cls.REBOOT_IN_PROGRESS = False  # Re-enable logging after restore
+            return True
+        except Exception as e:
+            logger.error(f"Error in restore_data_process_files: {e}")
+            cls.REBOOT_IN_PROGRESS = False  # Re-enable even on error
+            return False
+
+    @classmethod
+    def get_all_data_processes_name(cls) -> List[str]:
+        """
+        Returns a list of all registered data process names.
+
+        Returns:
+            A list of data process names.
+
+        Example:
+            names = DataHandler.get_all_data_processes_name()
+        """
+        return list(cls.data_process_registry.keys())
+
+    # DEBUG ONLY
+    @classmethod
+    def get_all_data_processes(cls) -> List[DataProcess]:
+        """
+        Returns a list of all registered data process objects.
+
+        Returns:
+            A list of data process objects.
+
+        Example:
+            processes = DataHandler.get_all_data_processes()
+        """
+        return list(cls.data_process_registry.values())
+
+    @classmethod
+    def get_storage_info(cls, tag_name: str):
+        """
+        Prints the storage information for the specified data process.
+
+        Parameters:
+            tag_name (str): The name of the data process.
+
+        Raises:
+            KeyError: If the provided tag name is not registered in the data process registry.
+
+        Returns:
+            Tuple containing storage information for the tag name if it exists
+
+        Example:
+            DataHandler.get_storage_info('tag_name')
+        """
+        try:
+            if tag_name in cls.data_process_registry:
+                return cls.data_process_registry[tag_name].get_storage_info()
+            else:
+                raise KeyError("File process not registered.")
+        except KeyError as e:
+            logger.warning(f"Error: {e}")
+
+    @classmethod
+    def data_process_exists(cls, tag_name: str) -> bool:
+        """
+        Check if a data process with the specified tag name exists.
+
+        Parameters:
+            tag_name (str): The name of the data process.
+
+        Returns:
+            bool: True if the data process exists, False otherwise.
+        """
+        return tag_name in cls.data_process_registry
+
+    @classmethod
+    def file_process_exists(cls, tag_name: str) -> bool:
+        """
+        Check if a file process with the specified tag name exists.
+
+        Parameters:
+            tag_name (str): The name of the file process.
+
+        Returns:
+            bool: True if the file process exists, False otherwise.
+        """
+        if tag_name in cls.data_process_registry:
+            return isinstance(cls.data_process_registry[tag_name], FileProcess)
+        return False
+
+    @classmethod
+    def get_file_count(cls, tag_name: str) -> int:
+        """
+        Get the number of complete files in a file process directory.
+        Excludes the configuration file and currently open file.
+
+        Parameters:
+            tag_name (str): The name of the file process.
+
+        Returns:
+            int: Number of complete files, or 0 if the process doesn't exist or isn't a FileProcess.
+
+        Example:
+            image_count = DataHandler.get_file_count('img')
+        """
+        if not cls.file_process_exists(tag_name):
+            logger.warning(f"File process '{tag_name}' does not exist.")
+            return 0
+
+        try:
+            process = cls.data_process_registry[tag_name]
+            file_list = process.get_sorted_file_list()
+
+            current_filename = None
+            # Only exclude current_path if the file is actually open
+            # If status is CLOSED, current_path might point to a pre-generated filename that hasn't been created yet
+            if process.current_path and process.status == _OPEN:
+                current_filename = process.current_path.split("/")[-1]
+
+            complete_files = [f for f in file_list if f != _PROCESS_CONFIG_FILENAME and f != current_filename]
+
+            return len(complete_files)
+        except Exception as e:
+            logger.error(f"Error counting files for '{tag_name}': {e}")
+            return 0
+
+    @classmethod
+    def is_file_process(cls, tag_name: str) -> bool:
+        """
+        Alias for file_process_exists for clearer naming.
+
+        Parameters:
+            tag_name (str): The name of the file process.
+
+        Returns:
+            bool: True if the file process exists, False otherwise.
+        """
+        return cls.file_process_exists(tag_name)
+
+    @classmethod
+    def request_TM_path(cls, tag_name, latest=False, file_time=None):
+        """
+        Returns the path of a designated file available for transmission.
+        If no file is available, the function returns None.
+
+        The function store the file path to be excluded in a separate list.
+        Once fully transmitted, notify_TM_path() must be called to remove the file from the exclusion list
+        and prepare for deletion.
+        """
+        try:
+            if tag_name in cls.data_process_registry:
+                return cls.data_process_registry[tag_name].request_TM_path(latest=latest, file_time=file_time)
+            else:
+                raise KeyError("Data  process not registered!")
+        except KeyError as e:
+            logger.critical(f"Error: {e}")
+
+    @classmethod
+    def notify_TM_path(cls, tag_name, path):
+        """
+        Acknowledge the transmission of the file.
+        The file is then removed from the exclusion list.
+        """
+        try:
+            if tag_name in cls.data_process_registry:
+                cls.data_process_registry[tag_name].notify_TM_path(path)
+            else:
+                raise KeyError(f"Data process {tag_name} not registered!")
+        except KeyError as e:
+            logger.critical(f"Error: {e}")
+
+    @classmethod
+    def clean_up(cls):
+        """
+        Clean up the files that have been transmitted and acknowledged.
+        """
+        if cls.REBOOT_IN_PROGRESS:  # Skip if reboot in progress
+            return
+
+        for tag_name in cls.data_process_registry:
+            cls.data_process_registry[tag_name].clean_up()
+
+    @classmethod
+    def check_circular_buffers(cls):
+        """
+        Check the circular buffers for each data process and mark for deletion the oldest files if necessary
+        while taking into account the existing paths that are excluded or already marked for deletion.
+        """
+        if cls.REBOOT_IN_PROGRESS:  # Skip if reboot in progress
+            return
+
+        for tag_name in cls.data_process_registry:
+            cls.data_process_registry[tag_name].check_circular_buffer()
+
+    @classmethod
+    def delete_all_files(cls, path=None):
+        if path is None:
+            path = _HOME_PATH
+        try:
+            for file_name in os.listdir(path):
+                file_path = join_path(path, file_name)
+                if os.stat(file_path)[0] & 0x8000:  # Check if file is a regular file
+                    os.remove(file_path)
+                elif os.stat(file_path)[0] & 0x4000:  # Check if file is a directory
+                    cls.delete_all_files(file_path)  # Recursively delete files in subdirectories
+                    os.rmdir(file_path)  # Delete the empty directory
+            logger.info("All files and directories deleted successfully!")
+        except Exception as e:
+            logger.warning(f"Error deleting files and directories: {e}")
+
+    @classmethod
+    def get_current_file_size(cls, tag_name):
+        try:
+            if tag_name in cls.data_process_registry:
+                return cls.data_process_registry[tag_name].get_current_file_size()
+            else:
+                raise KeyError("File process not registered!")
+        except KeyError as e:
+            logger.warning(f"Error: {e}")
+
+    @classmethod
+    def compute_total_size_files(cls, root_path: str = None) -> int:
+        """
+        Computes the total size of all files under the sd_path.
+        not used anymore, slow and does not calculate everything
+        now using the filesystem function
+
+        Returns:
+        - The total size in bytes.
+        """
+        # TODO Remove recursion, really bad
+        if root_path is None:
+            root_path = _HOME_PATH
+        total_size: int = 0
+        for entry in os.listdir(root_path):
+            file_path: str = join_path(root_path, entry)
+            if os.stat(file_path)[0] & 0x4000:  # Check if entry is a directory
+                total_size += cls.compute_total_size_files(
+                    file_path
+                )  # Recursively compute total size of files in subdirectories
+            else:
+                total_size += os.stat(file_path)[6]
+            pass
+        return int(total_size)
+
+    @classmethod
+    def update_SD_usage(cls) -> None:
+        cls._SD_USAGE = cls.fs_sd_size()
+
+    @classmethod
+    def fs_sd_size(cls):
+        """
+        Will return the size of the sd card in bytes according to the file system information
+        """
+        # Get filesystem stats for the SD card mount point
+        stat = os.statvfs('/sd')
+
+        # Calculate total size
+        block_size = stat[0]      # Size of a block
+        total_blocks = stat[2]    # Total number of blocks
+        free_blocks = stat[3]     # Free blocks
+
+        total_size = block_size * total_blocks
+        free_size = block_size * free_blocks
+        used_size = total_size - free_size
+
+        return used_size
+
+    @classmethod
+    def SD_usage(cls) -> int:
+        return cls._SD_USAGE
+
+    # DEBUG ONLY
+    @classmethod
+    def print_directory(cls, path: str = None, tabs: int = 0) -> None:
+        """
+        Prints the directory contents recursively.
+
+        Parameters:
+            path (str, optional): The path of the directory. Defaults to "/sd".
+            tabs (int, optional): The number of tabs for indentation. Defaults to 0.
+
+        Returns:
+            None
+        """
+        if path is None:
+            path = _HOME_PATH
+        for file in os.listdir(path):
+            stats = os.stat(join_path(path, file))
+            filesize = stats[6]
+            isdir = stats[0] & 0x4000
+            if filesize < 1000:
+                sizestr = str(filesize) + " by"
+            elif filesize < 1000000:
+                sizestr = "%0.1f KB" % (filesize / 1000)
+            else:
+                sizestr = "%0.1f MB" % (filesize / 1000000)
+            printname = ""
+            for _ in range(tabs):
+                printname += "   "
+            printname += file
+            if isdir:
+                printname += "/"
+            print("{0:<40} Size: {1:>10}".format(printname, sizestr))
+            # recursively print directory contents
+            if isdir:
+                cls.print_directory(join_path(path, file), tabs + 1)
+
+    @classmethod
+    def _check_tag_name(cls, tag_name: str) -> bool:
+        """
+        Checks if the tag name is valid.
+        """
+        if tag_name in cls.data_process_registry:
+            return True
+        else:
+            logger.critical("Data process '{}' not registered!".format(tag_name))
+            return False
+
+
+def path_exist(path: str) -> bool:
+    """
+    Replacement for os.path.exists() function, which is not implemented in micropython.
+    If the request for a directory, the function will return True if the directory exists,
+    even if it is empty.
+    """
+    try_path = path
+    if path[-1] == "/":
+        try_path = path[:-1]
+
+    try:
+        os.stat(try_path)
+        return True
+    except OSError as e:
+        logger.info(f"{e} - {try_path} doesn't exist")
+        return False
+
+
+def join_path(*paths: str) -> str:
+    """
+    Join multiple paths together into a single path.
+
+    Args:
+        *paths: Variable number of paths to be joined.
+
+    Returns:
+        The joined path.
+    """
+    if not paths:
+        return ""
+
+    joined_path = "/".join(paths)
+    normalized_path = re.sub(r"/+", "/", joined_path)  # remove multiple slashes
+    # Remove leading slash if this was not an absolute path
+    if not paths[0].startswith("/"):
+        normalized_path = normalized_path.lstrip("/")
+    return normalized_path
+
+
+def extract_time_from_filename(filename: str) -> int:
+    """
+    Extracts the timestamp from a filename formatted as 'TAGNAME_TIME.bin' or 'img_TIME.jpg'.
+
+    Args:
+        filename (str): The filename to extract the timestamp from.
+
+    Returns:
+        int: The timestamp extracted from the filename.
+    """
+    if not filename:
+        return None
+
+    if filename[-4:] == ".bin" or filename[-4:] == ".jpg":
+        filename = filename[:-4]
+    else:
+        logger.warning(f"Invalid filename format for {filename}")
+        return None
+
+    match = re.search(r"_(\d+)", filename)
+    if match:
+        return int(match.group(1))
+    else:
+        logger.warning(f"Invalid filename format for {filename}")
+        return None
+
+
+def get_closest_file_time(file_time: int, files: List[str]):
+    """
+    Search through all the files to find the file name with the closest file time requested.
+    Used for requesting file paths
+
+    Args:
+        file_time(int): The requested file time
+        files(List[str]): A List of all the files for that data process
+
+    Returns:
+        str: file path with the closest file time to the one requested
+    """
+    # Search for the specific file with closest time to requested file time
+    try:
+        return min(files, key=lambda f: abs(extract_time_from_filename(f) - file_time))
+    except TypeError as e:
+        logger.warning(f"Could not find closest file time: {e}")
+        return None

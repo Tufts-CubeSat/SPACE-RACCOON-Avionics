@@ -1,0 +1,985 @@
+"""
+
+Command Definitions
+
+======================
+
+This modules contains the definition of the command functions for the satellite.
+
+
+Each command is defined as follows:
+- ID: A unique identifier for the command.
+- Name: A string representation of the command for debugging.
+- Description: A brief description of the command.
+- Arguments: A list of parameters that the command accepts.
+
+See the documentation for a full description of each command.
+
+Author: Ibrahima S. Sow
+
+"""
+
+import os
+
+import supervisor
+from apps.command.supervisor import CommandSupervisor
+from apps.comms.comms import SATELLITE_RADIO
+from apps.comms.fifo import QUEUE_STATUS, TransmitQueue
+from apps.comms.modes import COMMS_MODE as COMMS_MODE_ID
+from apps.digipeater import DigipeaterState
+from apps.telemetry.middleware import Frame as TelemetryFrame
+from apps.telemetry.splat.splat.telemetry_codec import Command
+from apps.telemetry.splat.splat.transport_layer import transaction_manager as TM
+from core import logger
+from core import state_manager as SM
+from core.data_handler import DataHandler as DH
+from core.logging import LEVELS as LOG_LEVELS
+from core.logging import RotatingFileHandler, getLogger
+from core.satellite_config import log_config as LOG_CONFIG
+from core.states import STATES, STR_STATES
+from core.time_processor import TimeProcessor as TPM
+from hal.configuration import SATELLITE
+
+FILE_PKTSIZE = 240
+COMMAND_REGISTRY = {}
+
+
+def register_command(name=None):
+    """Decorator to register a command handler in COMMAND_REGISTRY."""
+
+    def decorator(func):
+        command_name = name or func.__name__
+        COMMAND_REGISTRY[command_name] = func
+        return func
+
+    return decorator
+
+
+@register_command()
+def REBOOT(selector):
+    """
+    Select and execute one of the available reboot flows
+    0 -> Force reboot: immediately triggers a reboot without any cleanup (supervisor.reload())
+    1 -> Graceful reboot: attempts to gracefully shutdown the satellite by first shutting down the
+            data handler to ensure all files are properly closed, then triggers a reboot (SATELLITE.reboot())
+    2 -> Main power reboot: directly cuts the main power to the satellite, which will trigger a hard reboot
+    3 -> ACK reboot: sends an ACK to the ground station confirming the reboot command,
+            then triggers a reboot after the ACK is sent and the transmit queue is drained (CommandSupervisor.request_reboot())
+    4 -> PET reboot: resets the regular reboot timer to prevent an imminent reboot, without
+            actually rebooting the satellite (used when the satellite is about to reboot but we want to keep it on for longer)
+    """
+    # 0 = force reboot
+    if selector == 0:
+        logger.info("Executing REBOOT: FORCE")
+        supervisor.reload()
+        return []
+
+    # 1 = graceful reboot
+    if selector == 1:
+        logger.info("Executing REBOOT: GRACEFUL")
+        try:
+            # shutdown DH to make sure all files are closed properly
+            response = DH.graceful_shutdown()
+            if not response:
+                logger.error("Failed to gracefully shutdown data handler, aborting reboot")
+                return ["graceful reboot failed: DH shutdown failed"]
+            SATELLITE.reboot()
+            return [1]  # this will never be returned
+
+        except Exception as e:
+            logger.error(f"Failed to gracefully reboot the satellite: {e}")
+            return [f"graceful reboot failed: {e}"]
+
+    # 2 = main power reboot
+    elif selector == 2:
+        logger.info("Executing REBOOT: MAIN_POWER")
+        try:
+            SATELLITE.reboot()
+            return [2]  # this will never be returned
+        except Exception as e:
+            logger.error(f"Failed to reboot the satellite: {e}")
+            return [f"main power reboot failed: {e}"]
+
+    # 3 = ack reboot
+    elif selector == 3:
+        logger.info("Executing REBOOT: ACK")
+        CommandSupervisor.request_reboot()
+        return [3]
+
+    # 4 = PET reboot
+    elif selector == 4:
+        logger.info("Executing REBOOT: PET")
+        try:
+            from tasks import hal_monitor
+            current_time = TPM.monotonic()
+            hal_monitor._BOOT_TIME = current_time
+            return [4]
+        except Exception as e:
+            logger.error(f"[REBOOT_PET] Failed to reset regular reboot timer: {e}")
+            return [f"pet failed: {e}"]
+
+    logger.error(f"Invalid reboot selector: {selector}")
+    return [-1]
+
+
+@register_command()
+def PING(string="Hello From Space!"):
+    """
+    Command to test the communication with the satellite
+    will respond with whatever string it received
+    """
+    logger.info(f"Executing PING with string: {string}")
+    return [string]
+
+
+@register_command()
+def SEND_ONES():
+    """
+    This is a simple command that will be use to conduct IST experiment
+    The idea is that when this command is received it will generate a packet with only 1s
+    This packet has to be sent without a header, so the digipeater comms function will be used
+    """
+
+    from apps.comms.comms import SATELLITE_RADIO
+
+    logger.debug("Generating 1s packet")
+
+    packet = bytearray([0xff] * 255)
+    status = SATELLITE_RADIO.transmit_digi_packet(packet)
+    return [status]
+
+
+@register_command()
+def GET_COMMAND_LIST(skip_elements=0):
+    """
+    Get a list of commands from spalt
+    It should give the command name and id
+    """
+    from apps.telemetry.splat.splat.telemetry_definition import command_list
+
+    return command_list[skip_elements:]
+
+
+@register_command()
+def SWITCH_TO_STATE(target_state_id, time_in_state=None):
+    """Forces a switch of the spacecraft to a specific state."""
+    logger.info(f"Executing SWITCH_TO_STATE with target_state: {STR_STATES[target_state_id]}, time_in_state: {time_in_state}")
+    SM.start_forced_state(target_state_id, time_in_state)
+    return []
+
+
+@register_command()
+def UPLINK_TIME_REFERENCE(time_reference):
+    """Sends a time reference to the spacecraft to update the time processing module."""
+    logger.info(f"Executing UPLINK_TIME_REFERENCE with current_time: {time_reference}")
+    TPM.set_time(time_reference)
+    return []
+
+
+@register_command()
+def PAYLOAD_SWITCH(selector):
+    """
+    This command is mostly used for debug. But it might come in handy in flight
+    it will turn on or off the power to the jetson
+    be careful with this command in flight
+    considering removing the capability to turn on the payload in flight
+        as you will not be able to do anything with it on
+        payload app is responbile for turning on and off the payload
+    """
+    logger.info("Executing PAYLOAD_SWITCH")
+
+    if not SATELLITE.PAYLOADPOWER_AVAILABLE:
+        logger.warning("[PAYLOAD] Payload power pins is not available.")
+        return [-2]  # "payload power pins not available"
+
+    if selector == 0:
+        try:
+            logger.info("[PAYLOAD] Shutdown command sent successfully, waiting for payload to shutdown before cutting power")
+            SATELLITE.JETSON_ENABLE.value = False
+            TPM.sleep(0.1)
+            SATELLITE.JETSON_SD_REQ.value = False  # turn of 5v dcdc to save more power
+            return [selector]  # "payload power off"
+        except Exception as e:
+            logger.error(f"[PAYLOAD] Failed to disable payload power: {e}")
+            return [f"error turning off payload: {e}"]
+
+    if selector == 1:
+        try:
+            SATELLITE.JETSON_SD_REQ.value = True  # turn of 5v dcdc to save more power
+            TPM.sleep(0.1)
+            SATELLITE.JETSON_ENABLE.value = True
+            logger.info("[PAYLOAD] Jetson power enabled successfully.")
+            return [selector]  # "payload power on"
+        except Exception as e:
+            logger.error(f"[PAYLOAD] Failed to enable payload power: {e}")
+            return [f"error turning on payload: {e}"]
+
+    return [-1]  # "invalid payload switch status"
+
+
+@register_command()
+def RF_SWITCH(selector):
+    """
+    Turn on or off all rf transmissions from the satellite
+    this is latching command (will last over reboots)
+    0 -> turn off RF transmissions (enter RF_STOP mode)
+    1 -> turn on RF transmissions (enter STANDARD mode)
+    """
+
+    if selector == 0:
+        logger.warning("Executing RF_SWITCH (turn off): will disable TX after ACK")
+        CommandSupervisor.request_rf_stop()
+        return [0]
+    if selector == 1:
+        logger.warning("Executing RF_SWITCH (turn on)")
+        CommandSupervisor.cancel_pending_rf_stop()
+        SATELLITE_RADIO.set_comms_mode(COMMS_MODE_ID.STANDARD)
+        return [1]
+    logger.warning(f"Executing RF_SWITCH with invalid selector: {selector}")
+    return [-1]
+
+
+@register_command()
+def DIGIPEATER_SWITCH(selector):
+    """Activates or deactivates the digipeater relay subsystem."""
+    if selector == 0:
+        logger.warning("Executing DIGIPEATER_SWITCH (deactivate)")
+        return DigipeaterState.deactivate()
+    elif selector == 1:
+        logger.warning("Executing DIGIPEATER_SWITCH (activate)")
+        return DigipeaterState.activate()
+    else:
+        logger.warning(f"Executing DIGIPEATER_SWITCH with invalid selector: {selector}")
+        return [-1]
+
+
+@register_command()
+def SET_FSK(freq, power, br, ps, bandwidth, f_dev, p_len, p_detect, crc_type, whitening):
+    """
+    Sets the radio modulation to FSK for the next transmission
+    Calling the driver here directly to avoid passing a lot of arguments around
+
+    will triplicate the tx burst size to make up for the faster transmission in fsk compared to lora
+
+    for some reason the objects are wrapped in object wrapper
+    and object wrapper does not support __setattr__ so we are unable to change the values
+    to minimize changes, here we will use the obj attribute
+    doing all of this to avoid sending a lot of arguments in beginFSK
+    to avoid exhausting the stack
+    """
+    from hal.configuration import SATELLITE
+
+    logger.warning("Executing SET_FSK: setting modulation to FSK for next transmission")
+
+    if not SATELLITE.RADIO_AVAILABLE:
+        logger.error("[COMMS ERROR] RADIO no longer active on SAT")
+        return ["radio not available"]
+
+    SATELLITE.RADIO.obj._FREQ = freq
+    SATELLITE.RADIO.obj._POWER = power
+    SATELLITE.RADIO.obj._bitrate = br
+
+    try:
+        SATELLITE.RADIO.beginFSK(
+            pS=ps,
+            bW=bandwidth,
+            fDev=f_dev,
+            preLength=p_len,
+            preDetect=p_detect,
+            crcType=crc_type,
+            whitening=whitening,
+        )
+
+        # in fsk transmission is way faster compared to lora (>3 times)
+        # burst size depends on the set bitrate. Considering lora bps as 6k to allow for margin
+        SATELLITE_RADIO.TX_BURST_SIZE = 15 * br // 6000
+
+    except Exception as e:
+        logger.error(f"FSK fail: {e}")
+        logger.error("Rebooting satellite")
+        supervisor.reload()     # if we have a problem with setting fsk, to be safe, lets just reboot satellite
+        return ["fsk_failed"]   # this is never gonna be sent to the user
+
+    return ["fsk set"]
+
+
+@register_command()
+def REQUEST_TM_NOMINAL():
+    """Requests a nominal snapshot of all subsystems."""
+    logger.info("Executing REQUEST_TM_NOMINAL")
+    # Pack telemetry
+    packet = TelemetryFrame.pack_tm_heartbeat()
+    q_stat = TransmitQueue.push_packet(packet)
+    if q_stat != QUEUE_STATUS.OK:
+        logger.error(f"Failed to push nominal telemetry to transmit queue with status: {q_stat}")
+    logger.info(f"Telemetry nominal packed and pushed to transmit queue {q_stat}")
+
+    return [q_stat]
+
+
+@register_command()
+def REQUEST_TM_STORAGE():
+    """Requests full storage status of the mainboard, including details on onboard processes."""
+    logger.info("Executing REQUEST_TM_STORAGE")
+    # Pack telemetry
+    packet = TelemetryFrame.pack_tm_storage()
+    q_stat = TransmitQueue.push_packet(packet)
+    if q_stat != QUEUE_STATUS.OK:
+        logger.error(f"Failed to push storage telemetry to transmit queue with status: {q_stat}")
+    logger.info(f"Telemetry storage packed and pushed to transmit queue {q_stat}")
+
+    return [q_stat]
+
+
+@register_command()
+def REQUEST_TM_PAYLOAD():
+    """Requests telemetry data from the payload, provided it is on."""
+    logger.info("Executing REQUEST_TM_PAYLOAD")
+    # Pack telemetry
+    packet = TelemetryFrame.pack_tm_payload()
+    q_stat = TransmitQueue.push_packet(packet)
+    if q_stat != QUEUE_STATUS.OK:
+        logger.error(f"Failed to push payload telemetry to transmit queue with status: {q_stat}")
+    logger.info(f"Telemetry payload packed and pushed to transmit queue {q_stat}")
+
+    return [q_stat]
+
+
+@register_command()
+def EVAL_STRING_COMMAND(string_command):
+    """
+    As of right now this is just for debugging purposes
+    will receive a string, will eval it and return the results.
+    [TODO] - This is a potential security risk. Should create some sort of firewall that can be controlled
+    with another command to allow/disallow evalling commands
+    """
+    logger.info(f"Executing EVAL_STRING_COMMAND with request: {string_command}")
+
+    try:
+        result = eval(string_command)
+        return [result]
+    except Exception as e:
+        logger.error(f"EVAL_STRING_COMMAND execution failed: {e}")
+        return ["eval_string_command_failed"]
+
+
+@register_command()
+def PREPARE_LOG_DOWNLINK():
+    """Freeze current system logs into a staging file safe from rotation.
+
+    Rotates the active log (fsw.log -> fsw.log.1) and moves that rotated file
+    to a stable path (fsw.log.downlink) that the rotation sequence will never
+    touch. The ground station then runs the standard CREATE_TRANS /
+    GENERATE_X_PACKETS / CONFIRM_LAST_BATCH loop against that staging path.
+    Logging continues normally on a fresh fsw.log throughout.
+
+    Returns:
+        [staging_path, file_size]                 on success
+        ["empty"]                                 if nothing to downlink
+        ["no_file_handler"]                       if file logging isn't up
+        ["rollover_failed"] / ["rename_failed"]   on filesystem failure
+    """
+    logger.info("Executing PREPARE_LOG_DOWNLINK")
+
+    core_logger = getLogger("core_logger")
+    file_handler = None
+    for h in core_logger._handlers:
+        if isinstance(h, RotatingFileHandler):
+            file_handler = h
+            break
+    if file_handler is None:
+        logger.error("PREPARE_LOG_DOWNLINK: no file handler registered")
+        return ["no_file_handler"]
+
+    staging_path = LOG_CONFIG.LOG_FILENAME + ".downlink"
+    rotated_path = LOG_CONFIG.LOG_FILENAME + ".1"
+
+    # Best-effort remove of any stale staging file from a prior session
+    # (e.g. previous downlink interrupted before CLEANUP).
+    try:
+        os.remove(staging_path)
+    except OSError:
+        pass
+
+    # Rotate fsw.log -> fsw.log.1 (no-op if log is empty).
+    try:
+        file_handler.force_rollover()
+    except Exception as e:
+        logger.error(f"PREPARE_LOG_DOWNLINK: rollover failed: {e}")
+        return ["rollover_failed"]
+
+    # Move fsw.log.1 out of the rotation sequence into the staging path.
+    try:
+        os.rename(rotated_path, staging_path)
+    except OSError as e:
+        # ENOENT (errno 2) means no .1 existed — log was empty and no prior
+        # rotation had occurred. Legitimate "nothing to downlink" case.
+        if e.args and e.args[0] == 2:
+            return ["empty"]
+        logger.error(f"PREPARE_LOG_DOWNLINK: rename failed: {e}")
+        return ["rename_failed"]
+
+    try:
+        size = os.stat(staging_path)[6]
+    except OSError:
+        size = 0
+
+    return [staging_path, size]
+
+
+@register_command()
+def CLEANUP_LOG_DOWNLINK():
+    """Remove the log downlink staging file after a successful transfer.
+
+    Should be called by the ground station after CONFIRM_LAST_BATCH indicates
+    zero missing fragments. Safe (idempotent) if the file is already gone.
+
+    Returns:
+        ["cleaned"]     on success
+        ["not_found"]   if no staging file existed (idempotent)
+        ["error: ..."]  on other filesystem failures
+    """
+    logger.info("Executing CLEANUP_LOG_DOWNLINK")
+    staging_path = LOG_CONFIG.LOG_FILENAME + ".downlink"
+    try:
+        os.remove(staging_path)
+    except OSError as e:
+        if e.args and e.args[0] == 2:
+            return ["not_found"]
+        logger.error(f"CLEANUP_LOG_DOWNLINK: remove failed: {e}")
+        return [f"error: {e}"]
+    return ["cleaned"]
+
+
+@register_command()
+def SET_LOG_LEVEL(level_id):
+    """Change the SD-card file log level and persist it in NVM.
+
+    Serial console level is fixed at boot from yaml and is intentionally
+    NOT affected by this command.
+
+    level_id is an index into core.logging.LEVELS:
+        0 NOTSET, 1 DEBUG, 2 INFO, 3 WARNING, 4 ERROR, 5 CRITICAL, 6 NOTHING.
+    The new level applies immediately to the RotatingFileHandler (if file
+    logging is up). It is also written to the NVM-backed StateFlags.f_log_level
+    byte so it survives a reboot; the persisted value is read by the
+    file-handler init in tasks/command.py.
+
+    Returns:
+        [level_id]            on success
+        ["invalid_level"]     if level_id is out of range (NVM untouched)
+        ["nvm_write_failed"]  if level changed in-memory but NVM write threw
+    """
+    logger.info(f"Executing SET_LOG_LEVEL with level_id: {level_id}")
+
+    if not isinstance(level_id, int) or level_id < 0 or level_id >= len(LOG_LEVELS):
+        logger.error(f"SET_LOG_LEVEL: invalid level_id {level_id}")
+        return ["invalid_level"]
+
+    level_int = LOG_LEVELS[level_id][0]
+
+    core_logger = getLogger("core_logger")
+    for h in core_logger._handlers:
+        if isinstance(h, RotatingFileHandler):
+            h.setLevel(level_int)
+            break
+
+    try:
+        SATELLITE.FLAGS.f_log_level = level_id
+    except Exception as e:
+        logger.error(f"SET_LOG_LEVEL: NVM write failed: {e}")
+        return ["nvm_write_failed"]
+
+    return [level_id]
+
+
+@register_command()
+def CREATE_TRANS(tid, string_command):
+    logger.info(f"GS requesting the following file {string_command} and tid: {tid}")
+
+    # 1. check if the file exists and get the path to the file
+    # 2. create a transaction in the transaction manager
+    transaction = TM.create_transaction(file_path=string_command, tid=tid, is_tx=True)
+    if transaction is None:
+        logger.error(f"Unable to create transaction {tid}")
+        return ["transaction_creation_failed"]
+
+    # 3. generate init transaction packet
+    cmd = Command("INIT_TRANS")
+    tid = transaction.tid
+    n_packets = transaction.number_of_packets
+
+    cmd.set_arguments(tid, n_packets)
+    q_stat = TransmitQueue.push_packet(cmd)
+    if q_stat != QUEUE_STATUS.OK:
+        logger.error(f"Failed to push INIT_TRANS command to transmit queue with status: {q_stat}")
+
+    return [tid, n_packets]
+
+
+@register_command()
+def GENERATE_X_PACKETS(tid, x):
+    """
+    Generate x packets for the given transaction and transmit them
+        - if x is 0, generate all packets for the transaction
+
+    """
+    # 1. search for the transaction id
+    transaction = TM.get_transaction(tid)
+    if transaction is None:
+        logger.error(f"Transaction with tid {tid} not found")
+        return ["transaction_not_found"]
+
+    # 2. generate the packets
+    if x == 0:
+        packet_list = transaction.generate_all_packets()
+    else:
+        packet_list = transaction.generate_x_packets(x)
+    # 3. add them to the transmit queue
+    for packet in packet_list:
+        q_stat = TransmitQueue.push_packet(packet)
+        if q_stat != QUEUE_STATUS.OK:
+            logger.error(f"Failed to push packet to transmit queue with status: {q_stat}")
+
+    return [len(packet_list)]
+
+
+@register_command()
+def GENERATE_SINGLE_PACKET(tid, seq_number):
+    # 1. search for the transaction id
+    transaction = TM.get_transaction(tid)
+    if transaction is None:
+        logger.error(f"Transaction with tid {tid} not found")
+        return ["transaction_not_found"]
+
+    # generate the packet
+    packet = transaction.generate_specific_packet(seq_number)
+    # 3. add it to the transmit queue
+    q_stat = TransmitQueue.push_packet(packet)
+    if q_stat != QUEUE_STATUS.OK:
+        logger.error(f"Failed to push packet to transmit queue with status: {q_stat}")
+
+    # Return the number of packets queued, for consistency with GENERATE_* commands
+    return [1]
+
+
+@register_command()
+def CONFIRM_LAST_BATCH(tid, bitmap_high, bitmap_low):
+    # 1. search for the transaction id
+    transaction = TM.get_transaction(tid)
+    if transaction is None:
+        logger.error(f"Transaction with tid {tid} not found")
+        return ["transaction_not_found"]
+
+    # 2. confirm last batch
+    len_missing_fragments = transaction.confirm_last_batch((bitmap_high, bitmap_low))
+
+    return [len_missing_fragments]
+
+
+@register_command()
+def UPDATE_MISSING_FRAGMENTS(tid, seq_offset, bitmap_high, bitmap_low):
+    # 1. search for the transaction id
+    transaction = TM.get_transaction(tid)
+    if transaction is None:
+        logger.error(f"Transaction with tid {tid} not found")
+        return ["transaction_not_found"]
+
+    # 2. update missing fragments
+    len_missing_fragments = transaction.update_missing_fragments_bitmap(seq_offset, (bitmap_high, bitmap_low))
+
+    return [len_missing_fragments]
+
+
+@register_command()
+def ADCS_CTRL_MODE(mode_id):
+    """Sends a command to change the ADCS controller mode."""
+    logger.info(f"Executing ADCS_CTRL_MODE with mode_id: {mode_id}")
+    if SM.current_state == STATES.LOW_POWER:
+        return [-2]
+    from apps.adcs.consts import ControllerModes
+
+    if not ((isinstance(mode_id, int)) and 0 <= mode_id <= 2):
+        logger.error(f"[ADCS] - Failed ADCS_CTRL_MODE, invalid mode_id {mode_id}")
+        return [-1]
+
+    valid = ControllerModes.update_mode(mode_id)
+    if valid:
+        return [ControllerModes.current_mode]
+    else:
+        logger.error("[ADCS] - Failed ADCS_CTRL_MODE, update_mode call fail")
+        return [-1]
+
+
+@register_command()
+def ADCS_UPDATE_MAG_BIAS(b_x, b_y, b_z):
+    """Updates the magnetometer hard-iron bias values in microtesla."""
+    if SM.current_state == STATES.LOW_POWER:
+        return [-2]
+    from apps.adcs.sensors import update_mag_bias
+
+    logger.info(f"Executing ADCS_UPDATE_MAG_BIAS with b_x: {b_x} uT, b_y: {b_y} uT, b_z: {b_z} uT")
+    update_mag_bias(float(b_x), float(b_y), float(b_z))
+    return [float(b_x), float(b_y), float(b_z)]
+
+
+@register_command()
+def LIST_DIR(skip_elements, string_command):
+    """
+    Try and list whatever is on the given directory
+    the result will be sent as a string, skip_elements will skip the first x elements
+    """
+
+    import os
+
+    try:
+        file_list = os.listdir(string_command)
+    except Exception as e:
+        return [f"error: {e}"]
+
+    return file_list[skip_elements:]
+
+
+@register_command()
+def GET_FILE_SIZE(string_command):
+    """
+    Try and get the size of a file
+    the result will be sent as a string
+    """
+
+    import os
+
+    try:
+        file_size = os.stat(string_command)[6]  # get the size of the file in bytes
+    except Exception as e:
+        return [f"error: {e}"]
+
+    return [file_size]
+
+
+@register_command()
+def DELETE_ALL_FILES():
+    """
+    Simple command that will delete all files
+    it will call datahandler function that will deal with it
+    """
+
+    try:
+        DH.delete_all_files()
+        supervisor.reload()  # reload after deleting all files to clear any references to deleted files in memory and reset the state of the satellite
+    except Exception as e:
+        return [f"error: {e}"]
+    return ["all files deleted"]
+
+
+@register_command()
+def DELETE_DP_FILES(x, string_command):
+    """
+    This is the command that will be used to delete data process files
+    Receives the following arguments:
+        - x: the number of files to delete
+            - x == 0 it will delete all files from the data process
+            - x == -1 it will assume the string command as a file path and will try and delete that file
+        - string_command: the name of the data process to delete the files from
+    """
+
+    if x < -1:
+        logger.error(f"Invalid x: {x}.")
+        return [f"invalid x: {x}"]
+
+    if x == -1:
+        # we will assume the string command as path to file and will try and delete the file
+        try:
+            os.remove(string_command)
+            logger.info(f"{string_command} deleted")
+            return [f"{string_command} deleted"]
+        except Exception as e:
+            logger.error(f"Failed delete {string_command}: {e}")
+            return [f"error deleting {string_command}: {e}"]
+
+    # the string command is the name of a data process
+
+    # 1. check if the data process exists
+    if not DH.data_process_exists(string_command):
+        logger.warning(f"No {string_command} in DH")
+        return [f"No {string_command} in DH"]
+
+    # 2. get the dh object from the data process
+    dp_obj = DH.data_process_registry[string_command]
+
+    # 3. find the current file
+    latest_file = dp_obj.current_path
+    file_name = latest_file.split("/")[-1]  # get the file name from the path
+    path_name = latest_file.replace(file_name, "")  # get the path by removing the file name from the path
+    logger.info(f"Current {string_command}: {latest_file}")
+
+    # 4. generate a list with all the files except the current file
+    file_list = DH.data_process_registry[string_command].get_sorted_file_list()
+    dir_len = len(file_list)
+    print("This is dir len: ", dir_len)
+    if x > 0:
+        # means that we do not want to delete all the files, need to edit file_list
+        file_list.remove(file_name)  # remove the current file from the list
+        x = min(x, len(file_list) - 1)  # make sure that x is not bigger than the number of files in the directory
+        file_list = file_list[1: x + 1]    # remove the config file and keep only the next x files
+
+    for file_name in file_list:
+        file_path = path_name + file_name
+        try:
+            os.remove(file_path)
+            logger.debug(f"{file_path} deleted")
+        except Exception as e:
+            logger.error(f"Failed delete {file_path}: {e}")
+            return [f"error deleting {file_path}: {e}"]
+
+    if x == 0:
+        # means that we deleted all the files (latest and config) and want to reboot
+        supervisor.reload()
+
+    return [dir_len - x]
+
+
+@register_command()
+def UPDATE_SD_USAGE():
+    """
+    Calls the DH function to compute the sd card usage and update it on the DH
+    it will also return the current sd_usage
+    """
+
+    try:
+        DH.update_SD_usage()
+        usage = DH.SD_usage()
+    except Exception as e:
+        return [f"error: {e}"]
+    return ["sd usage updated", usage]
+
+
+@register_command()
+def EXPERIMENT(
+    mode_id,
+    ts,
+    duration,
+    camera_bit_flag,
+    capture_rate,
+    imu_hz,
+    level_of_processing,
+    width,
+    height,
+    downscale_factor=2.0,
+    camera_defaults_selector=-1,
+    fps=0,
+    wbmode=0,
+    aelock=0,
+    awblock=0,
+    exposuretimerange_low=0,
+    exposuretimerange_high=0,
+    gainrange_low=0.0,
+    gainrange_high=0.0,
+    ispdigitalgainrange_low=0.0,
+    ispdigitalgainrange_high=0.0,
+    ee_mode=0,
+    ee_strength=0.0,
+    aeantibanding=0,
+    exposurecompensation=0.0,
+    tnr_mode=0,
+    tnr_strength=0.0,
+    saturation=0.0,
+):
+    """
+    Command that will be called by the ground station to start an experiment
+    ts                    -> the time at which the command should be ran (0 is to run now)
+    camera_bit_flag       -> the first 4 bits will indicate which cameras should be used to take the picture
+    level_of_processing   -> what level of processing to run TODO - add here the options
+    resolution            -> The resolution of the images. They are taken at full resolution and scaled down
+    """
+    from apps.payload.controller import PayloadController as PC
+    from core.time_processor import TimeProcessor as TPM
+    logger.info(f"[PAYLOAD] - Experiment command received to run at {ts}")
+    if ts != 0 and ts < TPM.time():
+        logger.error(f"[PAYLOAD] - Timestamp in the past: {ts}")
+        return False
+    result = PC.add_command_inference(
+        mode_id,
+        ts,
+        duration,
+        camera_bit_flag,
+        capture_rate,
+        imu_hz,
+        level_of_processing,
+        width,
+        height,
+        downscale_factor,
+        camera_defaults_selector,
+        fps,
+        wbmode,
+        aelock,
+        awblock,
+        exposuretimerange_low,
+        exposuretimerange_high,
+        gainrange_low,
+        gainrange_high,
+        ispdigitalgainrange_low,
+        ispdigitalgainrange_high,
+        ee_mode,
+        ee_strength,
+        aeantibanding,
+        exposurecompensation,
+        tnr_mode,
+        tnr_strength,
+        saturation,
+    )
+    if not result:
+        logger.error(f"[PAYLOAD] - Failed to add experiment command for timestamp {ts}")
+    return result
+
+
+@register_command()
+def SIMPLE_EXPERIMENT(
+    mode_id,
+    ts,
+    duration,
+    camera_bit_flag,
+    capture_rate,
+    imu_hz,
+    level_of_processing,
+    width,
+    height,
+    downscale_factor=2.0
+):
+    """
+    Command that will be called by the ground station to start an experiment
+    ts                    -> the time at which the command should be ran (0 is to run now)
+    camera_bit_flag       -> the first 4 bits will indicate which cameras should be used to take the picture
+    level_of_processing   -> what level of processing to run TODO - add here the options
+    resolution            -> The resolution of the images. They are taken at full resolution and scaled down
+
+    had to create a custom command for this because of the changes to splat
+    it is an exact copy of EXPERIMENT command
+
+    """
+    from apps.payload.controller import PayloadController as PC
+    from core.time_processor import TimeProcessor as TPM
+    logger.info(f"[PAYLOAD] - Simple experiment command received to run at {ts}")
+    if ts != 0 and ts < TPM.time():
+        logger.error(f"[PAYLOAD] - Timestamp in the past: {ts}")
+        return False
+    result = PC.add_command_inference(
+        mode_id,
+        ts,
+        duration,
+        camera_bit_flag,
+        capture_rate,
+        imu_hz,
+        level_of_processing,
+        width,
+        height,
+        downscale_factor
+    )
+    if not result:
+        logger.error(f"[PAYLOAD] - Failed to add simple experiment command for timestamp {ts}")
+    return result
+
+
+@register_command()
+def DATASET_PROCESSING(
+    ts,
+    duration,
+    level_processing,
+    rc_version,
+    ld_version,
+    bypass_preflt_rej,
+    dataset_path,
+):
+    """
+    Command that will be called by the ground station to start a dataset processing experiment
+    ts                    -> the time at which the command should be ran (0 is to run now)
+    level_processing      -> the level of processing to run on the dataset
+    rc_version            -> the version of the rc model to use for processing
+    ld_version            -> the version of the ld model to use for processing
+    bypass_preflt_rej     -> whether to bypass prefiltering rejection
+    dataset_path          -> the path to the dataset to process
+    """
+    from apps.payload.controller import PayloadController as PC
+    from core.time_processor import TimeProcessor as TPM
+
+    logger.info(f"[PAYLOAD] - Dataset processing command received to run at {ts}")
+    if ts != 0 and ts < TPM.time():
+        logger.error(f"[PAYLOAD] - Timestamp in the past: {ts}")
+        return False
+    result = PC.add_dataset_processing_command(
+        ts,
+        duration,
+        level_processing,
+        rc_version,
+        ld_version,
+        bypass_preflt_rej,
+        dataset_path,
+    )
+    if not result:
+        logger.error(f"[PAYLOAD] - Failed to add dataset processing command for timestamp {ts}")
+    return result
+
+
+@register_command()
+def DATASET_OD(ts, duration, max_iteration, dataset_path):
+    """
+    Command that will be called by the ground station to start a orbit determination processing experiment
+    ts                     -> the time at which the command should be ran (0 is to run now)
+    duration               -> the duration of the experiment in seconds
+    max_iteration          -> the maximum number of iterations for batch optimization
+    dataset_path           -> the path to the dataset to process
+
+    """
+    from apps.payload.controller import PayloadController as PC
+    from core.time_processor import TimeProcessor as TPM
+
+    logger.info(f"[PAYLOAD] - Dataset OD command received to run at {ts}")
+    if ts != 0 and ts < TPM.time():
+        logger.error(f"[PAYLOAD] - Timestamp in the past: {ts}")
+        return False
+    result = PC.add_dataset_od_command(ts, duration, max_iteration, dataset_path)
+    if not result:
+        logger.error(f"[PAYLOAD] - Failed to add dataset OD command for timestamp {ts}")
+    return result
+
+
+# @register_command()
+# def SYNCHRONIZE_TIME(rtc_time):
+#     """
+#     Command that will be called by the ground station to synchronize the time
+#     rtc_time               -> the real-time clock time to set
+
+#     """
+#     from apps.payload.controller import PayloadController as PC
+
+#     logger.info(f"[PAYLOAD] - Synchronize time command received with RTC time: {rtc_time}")
+#     result = PC.send_synchronize_time_command(rtc_time)
+#     if not result:
+#         logger.error("[PAYLOAD] - Failed to synchronize time")
+#     return result
+
+
+@register_command()
+def CLEAR_EXPERIMENT_LIST():
+    """
+    Command that will be called by the ground station to clear the list of scheduled experiments in the payload
+    returns the number of experiments that were cleared from the list
+    """
+    from apps.payload.controller import PayloadController as PC
+
+    logger.info("[PAYLOAD] - Clear experiment list command received")
+    cleared_count = PC.clear_experiment_list()
+    return [cleared_count]
+
+
+@register_command()
+def GET_EXPERIMENT_LIST(skip_elements=0):
+    """
+    Command that will be called by the ground station to get the list of scheduled experiments in the payload
+    returns a list of experiments ts
+    """
+    from apps.payload.controller import PayloadController as PC
+
+    logger.info("[PAYLOAD] - List experiments command received")
+    experiment_list = PC.list_experiments()
+    return experiment_list[skip_elements:]

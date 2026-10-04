@@ -1,0 +1,78 @@
+# Import this first
+import gc
+import sys
+import time
+
+import microcontroller
+from core import logger, setup_logger, state_manager
+from core.satellite_config import main_config as CONFIG
+from hal.configuration import SATELLITE
+
+# In emulator mode the HAL is the emulator package, which exposes SimulationComplete.
+# This import will fail on real hardware (different HAL), which is intentional.
+try:
+    from hal.simulator import SimulationComplete as _SimulationComplete
+except ImportError:
+    _SimulationComplete = None
+
+
+# Memory stats
+def print_memory_stats(call_gc=True):
+    if call_gc:
+        gc.collect()
+    print(f"Memory stats after gc: {call_gc}")
+    print(f"Total memory: {str(gc.mem_alloc() + gc.mem_free())} bytes")
+    print(f"Memory free: {str(gc.mem_free())} bytes")
+    print(f"Memory used: {int((gc.mem_alloc() / (gc.mem_alloc() + gc.mem_free())) * 100)}%")
+
+
+for path in ["/hal", "/apps", "/core"]:
+    if path not in sys.path:
+        sys.path.append(path)
+
+setup_logger(level=CONFIG.LOG_LEVEL)
+
+reset_reason = getattr(microcontroller.cpu, "reset_reason", None)
+print(f"Reset reason: {reset_reason}")
+logger.warning(f"Reset reason: {reset_reason}")
+
+print_memory_stats(call_gc=True)
+
+print("Booting ARGUS...")
+SATELLITE.boot_sequence()
+print("ARGUS booted.")
+print(f"Boot Errors: {SATELLITE.ERRORS}")
+
+
+print("Waiting 1 sec...")
+time.sleep(1)
+
+
+"""print("Running system diagnostics...")
+errors = SATELLITE.run_system_diagnostics()
+print("System diagnostics complete")
+print("Errors:", errors)
+"""
+
+print_memory_stats(call_gc=False)
+print_memory_stats(call_gc=True)
+
+try:
+    # Run forever
+
+    # from core import DataHandler as DH
+
+    # DH.delete_all_files()
+
+    logger.info("Starting state manager")
+    state_manager.start()
+
+except BaseException as e:
+    if _SimulationComplete is not None and isinstance(e, _SimulationComplete):
+        logger.info(f"Simulation complete: {e}")
+        sys.exit(0)
+    if isinstance(e, Exception):
+        logger.critical("ERROR:", e)
+        # TODO Log the error
+    else:
+        raise  # re-raise KeyboardInterrupt, SystemExit, etc.

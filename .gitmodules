@@ -1,0 +1,3 @@
+[submodule "FSW-mainboard/flight/apps/telemetry/splat"]
+	path = FSW-mainboard/flight/apps/telemetry/splat
+	url = https://github.com/cmu-argus-2/splat.git

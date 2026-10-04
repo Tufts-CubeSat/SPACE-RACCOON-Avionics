@@ -1,0 +1,11 @@
+numpy>=1.23.5
+pytest>=7.4.3
+mypy
+pybind11-stubgen
+pytest-html
+pytest-cov
+flake8==7.0.0
+# black==22.10.0
+isort==5.12.0
+pre-commit
+argparse
