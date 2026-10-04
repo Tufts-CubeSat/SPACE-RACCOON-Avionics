@@ -79,7 +79,7 @@ def test_forced_state_blocks_switching():
     sm.switch_to(STATES.NOMINAL)
     assert sm.current_state == STATES.EXPERIMENT
 
-    # update_time_in_state() is called once per second by the command task
+    # update_time_in_state() is called once per command-task cycle (tasks/command.py)
     for _ in range(3):
         sm.update_time_in_state()
 

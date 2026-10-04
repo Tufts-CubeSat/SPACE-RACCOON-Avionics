@@ -217,8 +217,9 @@ the boot count.
 
 ## EX-08 · Commands: "Commands out of order, and false failures" ★★☆ · 2 bugs
 
-> **Bug report #1:** During a pass the ground station uplinked three commands, A, B, C. The satellite ran them
-> **C, B, A**.
+> **Bug report #1:** Right now the comms task stores each received command with `overwrite_command()` (see the TODO in
+> `flight/tasks/comms.py`), so the queue only ever holds one command. A teammate tried switching it to `push_command()`
+> so that back-to-back uplinks aren't lost. In their test, commands queued as A, B, C ran as **C, B, A**.
 >
 > **Bug report #2:** The `EXPERIMENT` command clearly worked (the payload log shows the experiment was scheduled), but the
 > ACK sent to the ground says `COMMAND_EXECUTION_FAILED` (0x03).
@@ -233,7 +234,8 @@ the boot count.
 - **8.2** How does `@register_command()` work? What ends up in `COMMAND_REGISTRY`, and how does the processor use it?
 - **8.3** `CommandQueue` and `TransmitQueue` use class-level state and `@classmethod`s instead of instances. Why does
   that work as a way for tasks to talk to each other?
-- **8.4** What happens to a command that arrives while the command queue is full?
+- **8.4** The comms task uses `overwrite_command()`, not `push_command()`. What happens today if two commands arrive before
+  the command task gets to run? Which behavior would you choose for a satellite, and what would you need to check first?
 
 ---
 
