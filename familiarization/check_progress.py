@@ -53,14 +53,16 @@ def main():
     for ex_id, title, prefixes in EXERCISES:
         mine = {node: status for node, status in outcomes.items() if any(node.startswith(p) for p in prefixes)}
         passed = sum(1 for s in mine.values() if s == "PASSED")
-        complete = passed == len(mine)
+        complete = len(mine) > 0 and passed == len(mine)
         done += complete
         print(f"{ex_id:6} {title:34} {passed:>4}/{len(mine):<4}   {'DONE' if complete else '...'}")
     print("-" * 64)
 
     total_passed = sum(1 for s in outcomes.values() if s == "PASSED")
     print(f"Exercises complete: {done}/{len(EXERCISES)}      All tests: {total_passed}/{len(outcomes)} passing")
-    if total_passed == len(outcomes):
+    if any(s == "ERROR" for s in outcomes.values()):
+        print("\nSome tests could not even be collected (ERROR). Run `python -m pytest tests/` to see why.")
+    elif total_passed == len(outcomes):
         print("\nEvery test passes. Nice work! Now run the emulator and watch it reach NOMINAL.")
 
 

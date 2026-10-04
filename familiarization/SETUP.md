@@ -198,6 +198,7 @@ SPACE-RACCOON-Avionics/
 | Symptom | Fix |
 |---|---|
 | `ModuleNotFoundError: No module named 'apps.telemetry.splat.splat'` | The submodule is missing. Run `git submodule update --init` from the repo root. |
+| Clone or submodule fails with `Filename too long` (Windows) | Run `git config --global core.longpaths true`, or clone into a shorter path like `C:\dev\`. Then run `git submodule update --init`. |
 | `ModuleNotFoundError: No module named 'tests'` or `'flight'` | Run pytest **from `FSW-mainboard/`** and use `python -m pytest`, not bare `pytest`. |
 | `Python was not found; run without arguments to install from the Microsoft Store` | You ran `run.sh` on Windows. Use the manual emulator commands in section 5. |
 | `No module named pytest` | Your venv isn't active, or you skipped `pip install -r requirements.txt`. |
