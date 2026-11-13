@@ -1,0 +1,7 @@
+[submodule "FSW-mainboard/flight/apps/telemetry/splat"]
+	path = FSW-mainboard/flight/apps/telemetry/splat
+	url = https://github.com/cmu-argus-2/splat.git
+[submodule "FSW-mainboard/simulation"]
+	path = FSW-mainboard/simulation
+	url = https://github.com/cmu-argus-2/GNC-Simulation.git
+	branch = fsw_interface_2

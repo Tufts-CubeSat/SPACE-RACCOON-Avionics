@@ -1,0 +1,400 @@
+CR: 1.8
+Cd: 2.2
+CoM:
+- 0.0
+- 0.0
+- -0.005
+CoM_dev: 0.001
+CoP:
+- 0.0
+- 0.0
+- 0.0
+CoP_dev: 0.001
+MAX_TIME: 30000
+PlotFlags:
+  actuator_plots: true
+  att_animation: false
+  percent_to_log: 0.01
+  pointing_plots: true
+  sensor_measurements: true
+  true_state_plots: true
+area:
+  area_dev: 20
+  min_area: 0.01
+  nominal_area: 0.01
+debugFlags:
+  include_battery: true
+  include_star_tracker: false
+  perfect_sensors: false
+deployables:
+  N_deployables: 4
+  N_rand_deploy_fail: 0
+  deploy_status:
+  - true
+  - true
+  - true
+  - true
+  deployable_deployed_orient:
+  - 0.0
+  - 90.0
+  - 0.0
+  - 0.0
+  - -90.0
+  - 0.0
+  - 90.0
+  - 0.0
+  - 0.0
+  - -90.0
+  - 0.0
+  - 0.0
+  deployable_deployed_pos:
+  - 0.1
+  - 0.0
+  - 0.05
+  - -0.1
+  - 0.0
+  - 0.05
+  - 0.0
+  - 0.1
+  - 0.05
+  - 0.0
+  - -0.1
+  - 0.05
+  deployable_inertia:
+  - 5.2061e-05
+  - 0.0
+  - 0.0
+  - 0.0
+  - 3.065e-05
+  - 0.0
+  - 0.0
+  - 0.0
+  - 2.1408e-05
+  - 5.2061e-05
+  - 0.0
+  - 0.0
+  - 0.0
+  - 3.065e-05
+  - 0.0
+  - 0.0
+  - 0.0
+  - 2.1408e-05
+  - 3.065e-05
+  - 0.0
+  - 0.0
+  - 0.0
+  - 5.206e-05
+  - 0.0
+  - 0.0
+  - 0.0
+  - 2.1408e-05
+  - 3.065e-05
+  - 0.0
+  - 0.0
+  - 0.0
+  - 5.206e-05
+  - 0.0
+  - 0.0
+  - 0.0
+  - 2.1408e-05
+  deployable_mass:
+  - 0.0383
+  - 0.0383
+  - 0.0383
+  - 0.0383
+  deployable_sensor_flag:
+  - true
+  - false
+  - false
+  - true
+  deployable_stowed_orient:
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  deployable_stowed_pos:
+  - 0.05
+  - 0.0
+  - 0.0
+  - -0.05
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.05
+  - 0.0
+  - 0.0
+  - -0.05
+  - 0.0
+  random_deploy_fail: false
+dt: 0.1
+earliest_sim_start_time_UTC: 2026-06-01 12:00:00
+gps:
+  gps_dt: 1.0
+  gps_pos_std: 5
+  gps_pos_std_dev: 0
+  gps_vel_std: 0.03
+  gps_vel_std_dev: 0
+gyroscope:
+  gyro_bias_stab: 0.00083
+  gyro_correlation_time: 50000.0
+  gyro_scale_factor_err: 1.0e-05
+  gyro_sigma_v: 0.007
+  gyro_sigma_v_dev: 3
+  gyro_sigma_w: 1
+  gyro_sigma_w_dev: 3
+  nbits: 16
+  range: 125
+inertia:
+  nominal_inertia:
+  - 0.00229087756
+  - -1.8729e-05
+  - -5.2467e-06
+  - -1.8729e-05
+  - 0.00233687756
+  - 1.9134e-05
+  - -5.2467e-06
+  - 1.9134e-05
+  - 0.00237975511
+  principal_axis_dev:
+  - 0.4
+  - 0.4
+  - 0.4
+initialization:
+  AOP: 63
+  AOP_dev: 20
+  LTDN: 39600
+  LTDN_max: 40800
+  LTDN_min: 38400
+  RAAN: 171
+  RAAN_dev: 20
+  battery_capacity: 270000
+  battery_initial_soc: 35
+  battery_initial_temp: 273.16
+  battery_internal_resistance: 0.033
+  battery_radiative_loss: 4.2e-10
+  battery_thermal_mass: 276
+  disperse_AOP: true
+  disperse_LTDN: false
+  disperse_initial_angular_rate: true
+  disperse_initial_attitude: true
+  disperse_target_attitude: true
+  disperse_true_anomaly: true
+  eccentricity: 0.0
+  eccentricity_max: 0.004
+  eccentricity_min: 0.0
+  inclination: 97.75
+  inclination_dev: 0.1
+  initial_angular_rate:
+  - 1.0
+  - 1.0
+  - 1.0
+  initial_angular_rate_bound: 0.35
+  initial_angular_rate_dev: 0.175
+  initial_attitude:
+  - 1
+  - 0
+  - 0
+  - 0
+  initial_attitude_dev: 0.0
+  max_pack_voltage: 8.4
+  semimajor_axis: 6958000
+  semimajor_axis_dev: 20000
+  solar_heat_factor: 0.5
+  start_spin_stabilized: false
+  start_ss_pointed: false
+  start_ss_pointing: Sun
+  start_three_axis: false
+  target_attitude:
+  - 1
+  - 0
+  - 0
+  - 0
+  tgt_ss_ang_vel: 2.0
+  three_axis_target: Nadir
+  true_anomaly: 0
+latest_sim_start_time_UTC: 2028-10-28 23:59:59
+magnetometer:
+  magnetometer_dt: 0.2
+  magnetometer_noise_std: 1.4
+  magnetometer_std_dev: 0
+  range_xy: 1300
+  range_z: 2500
+  resolution: 0.3
+magnetorquers:
+  A_cross: 0.0054326
+  N_mtb: 6
+  N_rand_failures: 0
+  N_turns: 64
+  inductance: 1.0
+  inductance_dev: 5
+  inductance_lub: 10
+  mag_mtb_sens:
+  - 0.005
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.005
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.005
+  max_current_rating: 1.0
+  max_power: 1
+  max_voltage: 5
+  mtb_orientation:
+  - 1
+  - 0
+  - 0
+  - -1
+  - 0
+  - 0
+  - 0
+  - 1
+  - 0
+  - 0
+  - -1
+  - 0
+  - 0
+  - 0
+  - 1
+  - 0
+  - 0
+  - -1
+  mtb_orientation_dev: 0.001
+  mtb_resistance: 25
+  mtb_resistance_dev: 5
+  mtb_resistance_lub: 10
+  random_failures: false
+  working_status:
+  - true
+  - true
+  - true
+  - true
+  - true
+  - true
+mass:
+  mass_dev: 3
+  max_mass: 2.0
+  min_mass: 0.5
+  nominal_mass: 1.1468
+nadir_cam_dir:
+- -1
+- 0
+- 0
+photodiodes:
+  num_photodiodes: 9
+  photodiode_normals:
+  - 1
+  - 0
+  - 0
+  - -1
+  - 0
+  - 0
+  - 0
+  - 1
+  - 0
+  - 0
+  - -1
+  - 0
+  - 0.7071
+  - 0
+  - 0.7071
+  - 0
+  - 0.7071
+  - 0.7071
+  - -0.7071
+  - 0
+  - 0.7071
+  - 0
+  - -0.7071
+  - 0.7071
+  - 0
+  - 0
+  - -1
+  photodiode_orientation_dev: 0.001
+  photodiode_std: 500
+  photodiode_std_dev: 30
+  photodiodes_dt: 1.0
+reaction_wheels:
+  I_rw: 3.3878e-06
+  I_rw_dev: 5
+  N_rw: 0
+  m_rw: 0.002
+  max_speed: 600
+  max_torque: 0.001
+  nom_rw_ang_vel: 0
+  rw_orientation:
+  - 0
+  - 0
+  - 1
+  rw_orientation_dev: 0.001
+rtc:
+  rtc_drift_rate_std_ppm: 3.5
+  rtc_drift_rw_std_dev: 0.0
+  rtc_resolution: 1
+solar_panels:
+  area: 0.005
+  efficiency: 0.15
+  num_panels: 13
+  panel_normals:
+  - 1
+  - 0
+  - 0
+  - -1
+  - 0
+  - 0
+  - 0
+  - 1
+  - 0
+  - 0
+  - -1
+  - 0
+  - 0
+  - 0
+  - 1
+  - 0
+  - 0
+  - 1
+  - 0
+  - 0
+  - -1
+  - 0
+  - 0
+  - 1
+  - 0
+  - 0
+  - -1
+  - 0
+  - 0
+  - 1
+  - 0
+  - 0
+  - -1
+  - 0
+  - 0
+  - 1
+  - 0
+  - 0
+  - -1
+  panel_orientation_dev: 0.001
+star_tracker:
+  star_tracker_dt: 1.0
+  star_tracker_std: 0.001
+static_power_consumption:
+  jetson: 7.5
+  mainboard: 0.6
+useDrag: false
+useDragTorque: false
+useGravityGradient: false
+useLUTs: false
+useMoon: false
+useSRP: false
+useSun: false

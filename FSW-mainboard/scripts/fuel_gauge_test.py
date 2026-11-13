@@ -1,0 +1,40 @@
+import time
+
+import board
+import digitalio
+from busio import I2C
+from hal.drivers.max17205 import MAX17205
+from micropython import const
+
+I2C0_SDA = board.SDA0  # GPIO0
+I2C0_SCL = board.SCL0  # GPIO1
+
+# Line may not be connected, try except sequence
+try:
+    I2C0 = I2C(I2C0_SCL, I2C0_SDA)
+except Exception as e:
+    print("Error:", e)
+    I2C0 = None
+
+if hasattr(board, "PERIPH_PWR_EN"):
+    PERIPH_PWR_EN = digitalio.DigitalInOut(board.PERIPH_PWR_EN)
+    PERIPH_PWR_EN.direction = digitalio.Direction.OUTPUT
+    PERIPH_PWR_EN.value = True  # Enable peripherals if applicable
+
+FUEL_GAUGE_I2C = I2C0
+FUEL_GAUGE_I2C_ADDRESS_1 = const(0x36)
+FUEL_GAUGE_I2C_ADDRESS_2 = const(0x0B)
+
+fuel_gauge = MAX17205(FUEL_GAUGE_I2C, FUEL_GAUGE_I2C_ADDRESS_1, FUEL_GAUGE_I2C_ADDRESS_2)
+
+while True:
+    print("soc: ", fuel_gauge.read_soc())
+    print("capacity: ", fuel_gauge.read_capacity())
+    print("current: ", fuel_gauge.read_current())
+    print("voltage: ", fuel_gauge.read_voltage())
+    print("midvoltage: ", fuel_gauge.read_midvoltage())
+    print("cycles: ", fuel_gauge.read_cycles())
+    print("tte: ", fuel_gauge.read_tte())
+    print("ttf: ", fuel_gauge.read_ttf())
+    print("pwrp: ", fuel_gauge.read_time_pwrup())
+    time.sleep(1)

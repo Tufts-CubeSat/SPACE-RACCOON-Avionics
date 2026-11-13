@@ -1,0 +1,538 @@
+# Command task (C&DH)
+# This task handles spacecraft state, board status, and state transitions.
+# It also executes commands received from the ground station (TBD)
+
+import gc
+import os
+
+import apps.command.processor as processor
+import microcontroller
+from apps.adcs.consts import Modes
+from apps.command import QUEUE_STATUS, CommandQueue
+from apps.eps.eps import EPS_POWER_FLAG
+from apps.payload.controller import PayloadState
+from core import DataHandler as DH
+from core import TemplateTask
+from core import state_manager as SM
+from core.dh_constants import ADCS_IDX, CDH_IDX, EPS_IDX, PAYLOAD_IDX
+from core.logging import LEVELS as LOG_LEVELS
+from core.logging import Formatter, RotatingFileHandler, get_persisted_level_name, getLogger
+from core.satellite_config import command_config as CONFIG
+from core.satellite_config import log_config as LOG_CONFIG
+from core.states import STATES, STR_STATES
+from core.time_processor import TimeProcessor as TPM
+from hal.configuration import SATELLITE
+from micropython import const
+
+_TPM_INIT_TIMEOUT = const(10)  # seconds
+_EXIT_STARTUP_TIMEOUT = CONFIG.EXIT_STARTUP_TIMEOUT  # Already a const in satellite_config
+_DEPLOYABLE_STRENGTH = const(90)  # 0-255
+_ANTENNA_STRENGTH = const(80)
+_ANTENNA_PWM = const(2)
+_ANTENNA_DEPLOYMENT_TRIES = const(2)
+_DEPLOYMENT_INTERVAL = const(5)  # seconds
+_PWM_MIN = const(0)  # Minimum PWM value for deployment
+_FIRST_PWM = const(2)  # First PWM to start deployment
+_BURN_WIRE_TIMEOUT = CONFIG.BURN_WIRE_TIMEOUT  # number of tries
+_DEPLOYMENT_DISTANCE = const(2)  # distance(cm) threshold for deployment
+_SKIP_DEPLOYMENT = CONFIG.SKIP_DEPLOYMENT
+
+
+class Task(TemplateTask):
+
+    log_data = [0] * 7
+
+    log_commands = [0] * 3
+
+    gc.collect()
+    total_memory = gc.mem_alloc() + gc.mem_free()
+
+    log_print_counter = 0
+
+    def __init__(self, id):
+        super().__init__(id)
+        self.name = "COMMAND"
+        self.time_ref_set = False
+        self.boot_count = 0
+        self.restored = False
+
+        # Transition status from ADCS and EPS
+        self.ADCS_MODE = Modes.STABLE
+        self.EPS_MODE = EPS_POWER_FLAG.NOMINAL
+        self.PAYLOAD_MODE = PayloadState.IDLE
+
+        self.deployment_done = False
+        self.deploymentPWM = _FIRST_PWM
+        self.deploymentTries = 0
+        self.last_deployment_time = None
+
+        self.antenna_tries = 0
+        self.file_logging_enabled = False
+
+    def get_memory_usage(self):
+        return int(gc.mem_alloc() / self.total_memory * 100)
+
+    def deployment_sequence(self):
+        # ------------------------------------------------------------------------------------------------------------------------------------
+        # DEPLOYMENT SEQUENCE
+        # ------------------------------------------------------------------------------------------------------------------------------------
+        burn_wires = SATELLITE.BURN_WIRES
+        if self.deploymentPWM == _FIRST_PWM:
+            # Enable the first PWM
+            burn_wires.set_pwm(
+                self.deploymentPWM, _DEPLOYABLE_STRENGTH if self.deploymentPWM != _ANTENNA_PWM else _ANTENNA_STRENGTH
+            )
+        elif self.deploymentPWM >= _PWM_MIN:
+            # Disable previous PWM and enable current one
+            burn_wires.turn_off_pwm(self.deploymentPWM + 1)
+            burn_wires.set_pwm(
+                self.deploymentPWM, _DEPLOYABLE_STRENGTH if self.deploymentPWM != _ANTENNA_PWM else _ANTENNA_STRENGTH
+            )
+        burn_wires.enable_driver()
+        if self.deploymentPWM == _ANTENNA_PWM:
+            # always try and redeploy antenna as there's no deployment sensor
+            self.antenna_tries += 1
+            if self.antenna_tries >= _ANTENNA_DEPLOYMENT_TRIES:
+                self.deploymentPWM -= 1  # Decrement PWM for next deployment
+        else:
+            self.deploymentPWM -= 1  # Decrement PWM for next deployment
+
+    def check_one_deployment(self, dir: str) -> bool:
+        # ------------------------------------------------------------------------------------------------------------------------------------
+        # CHECK DEPLOYMENT STATUS
+        # ------------------------------------------------------------------------------------------------------------------------------------
+        available = SATELLITE.DEPLOYMENT_SENSOR_AVAILABLE(dir)
+        if available:
+            return SATELLITE.DEPLOYMENT_SENSOR_DISTANCE(dir) >= _DEPLOYMENT_DISTANCE
+        else:
+            return True  # Assume deployed if sensor not available
+
+    def check_deployment_status(self):
+        return self.check_one_deployment("XP") and self.check_one_deployment("YM")
+
+    def startup(self):
+        # ------------------------------------------------------------------------------------------------------------------------------------
+        # STARTUP SEQUENCE
+        # ------------------------------------------------------------------------------------------------------------------------------------
+
+        # Must perform / check all startup tasks here (rtc, sd, etc.)
+
+        # TODO: Verification checklist
+        # Goal is to report error but still allow to switch to operations
+        # Errors must be localized and not affect other tasks
+        # Boot errors and system diagnostics must be logged
+
+        # Neopixel for STARTUP (white)
+        if SATELLITE.NEOPIXEL_AVAILABLE:
+            SATELLITE.NEOPIXEL.fill([255, 255, 255])
+
+        if not DH.data_process_exists("cdh"):
+            data_format = "LLbbbbb"
+            DH.register_data_process("cdh", data_format, True, data_limit=100000)
+
+        # Restore boot count and deployment status from previous session
+        if not self.restored:
+            if not DH.data_process_exists("cdh"):
+                data_format = "LLbbbbb"
+                DH.register_data_process("cdh", data_format, True, data_limit=100000)
+
+            if SATELLITE.SD_CARD_AVAILABLE:
+                cdh_data = DH.data_process_registry["cdh"].get_latest_data()
+                if cdh_data is not None:
+                    self.boot_count = cdh_data[CDH_IDX.BOOT_COUNT] + 1
+                    self.deployment_done = bool(cdh_data[CDH_IDX.DEPLOYMENT_STATUS])
+                    self.log_info(f"Restored boot count to {self.boot_count}")
+                    self.log_info(f"Restored deployment status to {self.deployment_done}")
+                else:
+                    self.boot_count = 1
+                    self.log_info("SD card is available, but no CDH data was found; starting boot count at 1")
+            else:
+                self.boot_count = 1
+                self.log_info("SD card is not available; starting boot count at 1")
+
+            self.restored = True
+
+            # Log boot count immediately during startup
+            self.log_data[CDH_IDX.TIME] = TPM.time()
+            self.log_data[CDH_IDX.BOOT_COUNT] = self.boot_count
+            self.log_data[CDH_IDX.DEPLOYMENT_STATUS] = int(self.deployment_done)
+            DH.log_data("cdh", self.log_data)
+
+        # Check time_since_boot
+        time_since_boot = TPM.monotonic() - SATELLITE.BOOTTIME
+
+        """
+        In case the RTC has died, the TPM uses a time reference for time keeping
+        The time reference is used to get offset from time.time() in CPy.
+
+        If an old time reference is not available, we depend on state correction
+        from GPS or uplinked commands, and until then the time will be egregiously wrong.
+
+        This will not work until the OBDH initializes CDH data process, so we try this
+        for _TPM_INIT_TIMEOUT seconds since the SC has booted.
+        """
+
+        if time_since_boot < _TPM_INIT_TIMEOUT and SATELLITE.RTC_AVAILABLE is False and self.time_ref_set is False:
+            # Only worth it if the RTC is dead
+            if DH.data_process_exists("cdh"):
+                cdh_data = DH.get_latest_data("cdh")
+
+                if cdh_data:
+                    # Found an old timestamp reference
+                    TPM.set_time(cdh_data[CDH_IDX.TIME])
+                    self.time_ref_set = True
+                    self.log_info(f"Updated time reference for TPM: {TPM.time()}")
+
+                else:
+                    # If no RTC or old time reference available, TPM goes back to Jan 1st 2025
+                    self.log_warning("Cannot set time reference as CDH process has no latest data")
+            else:
+                # If no RTC or old time reference available, TPM goes back to Jan 1st 2025
+                self.log_warning("Cannot set time reference as CDH process does not exist")
+
+            if time_since_boot == _TPM_INIT_TIMEOUT - 1:
+                # Failed in initializing TPM, just initialize offset calculation
+                TPM.calc_time_offset()
+
+        else:
+            # If the DH successfully scanned the SD card, and it has been 5 secs since FSW boot
+            if DH.SD_SCANNED() and (self.deployment_done or time_since_boot > _EXIT_STARTUP_TIMEOUT):
+                if not DH.data_process_exists("cdh"):
+                    data_format = "LLbbbbb"
+                    # this is 14 bytes, in current config ~7.2bytes/s. 25k will be ~60min
+                    DH.register_data_process("cdh", data_format, True, data_limit=25_000, write_interval=5)
+
+                if not DH.data_process_exists("cmd_logs"):
+                    DH.register_data_process("cmd_logs", "LBB", True, data_limit=25_000)
+
+                # Enable file logging to SD card (runs once, after SD is confirmed ready)
+                if not self.file_logging_enabled:
+                    try:
+                        try:
+                            os.mkdir(LOG_CONFIG.LOG_DIR)
+                        except OSError:
+                            pass  # Directory already exists
+                        # Resolve and validate log level BEFORE opening the handler
+                        # (avoids file-handle leak on bad config and prevents silent
+                        # NOTSET fallback that would flood the SD with DEBUG output).
+                        # NVM override (set by SET_LOG_LEVEL) wins over yaml default.
+                        persisted_level = get_persisted_level_name()
+                        target_level_str = persisted_level if persisted_level is not None else LOG_CONFIG.LOG_FILE_LEVEL
+                        file_level = None
+                        for lvl_int, lvl_str in LOG_LEVELS:
+                            if lvl_str == target_level_str:
+                                file_level = lvl_int
+                                break
+                        if file_level is None:
+                            raise ValueError(f"Invalid LOG_FILE_LEVEL: {target_level_str!r}")
+
+                        file_handler = RotatingFileHandler(
+                            LOG_CONFIG.LOG_FILENAME,
+                            mode="a",
+                            maxBytes=LOG_CONFIG.LOG_FILE_MAX_BYTES,
+                            backupCount=LOG_CONFIG.LOG_FILE_BACKUP_COUNT,
+                        )
+                        file_handler.setLevel(file_level)
+                        formatter = Formatter(fmt="[{asctime}][{levelname}] {message}", style="{")
+                        file_handler.setFormatter(formatter)
+                        getLogger("core_logger").addHandler(file_handler)
+                        self.file_logging_enabled = True
+                        self.log_info("File logging enabled on SD card")
+                        self.log_warning(f"Reset reason: {getattr(microcontroller.cpu, 'reset_reason', None)}")
+                    except Exception as e:
+                        self.log_warning(f"File logging not available: {e}")
+
+                # check if the deployment is ready to be performed
+                deployment_time_check = (
+                    (TPM.monotonic() - self.last_deployment_time) >= _DEPLOYMENT_INTERVAL
+                    if self.last_deployment_time is not None
+                    else True
+                )
+
+                # TODO: add deployment flag
+                if _SKIP_DEPLOYMENT:
+                    self.log_info("Deployment skipped (SKIP_DEPLOYMENT=True)")
+                    self.deployment_done = True
+
+                if SATELLITE.BURN_WIRES_AVAILABLE and not self.deployment_done:
+                    # Deployment finished when the deployment PWM reaches 0
+                    if self.deploymentPWM < _PWM_MIN and deployment_time_check:
+                        self.deploymentTries += 1
+                        if self.check_deployment_status() or self.deploymentTries >= _BURN_WIRE_TIMEOUT:
+                            self.log_warning("Deployment complete")
+                            self.deployment_done = True
+                        else:
+                            self.log_warning("Deployment not successful, retrying deployment sequence...")
+                            self.deploymentPWM = _FIRST_PWM  # Reset PWM to retry deployment
+                            self.antenna_tries = 0
+                    elif self.deploymentPWM >= _PWM_MIN and deployment_time_check:
+                        self.log_info(f"Deployment sequence: {self.deploymentPWM}")
+                        self.last_deployment_time = TPM.monotonic()
+                        self.deployment_sequence()
+                else:
+                    if not SATELLITE.BURN_WIRES_AVAILABLE and not self.deployment_done:
+                        self.log_info("Burn wires not available, skipping deployment sequence...")
+                    # T0: Boot over and deployment complete
+                    if SATELLITE.BURN_WIRES_AVAILABLE:
+                        SATELLITE.BURN_WIRES.disable_driver()
+                    SATELLITE.DEPLOYMENT_SENSOR_STOP_RANGING("XP")
+                    SATELLITE.DEPLOYMENT_SENSOR_STOP_RANGING("YM")
+                    SM.switch_to(STATES.DETUMBLING)
+                    self.log_warning("T0: Transition from STARTUP to DETUMBLING")
+
+    def state_machine_execution(self):
+        # ------------------------------------------------------------------------------------------------------------------------------------
+        # STATE MACHINE
+        # ------------------------------------------------------------------------------------------------------------------------------------
+
+        """
+        For both the ADCS_MODE and EPS_MODE, hysteresis management is done
+        in the respective applications rather than this state machine.
+
+        The thresholds for entry and exit out of both these modes are different
+        to avoid hysteresis. Additionally, both subsystems use filtering (on hardware
+        in the EPS fuel gauge, in software inside the ADCS) to further remove the
+        possibility of hysteresis.
+
+        If either subsystem fails critically (no data process or latest data) this state
+        machine assumes a stable / nominal mode as a last resort "Hail Mary", to get
+        as much use out of the spacecraft as possible before it stops operation.
+        """
+
+        # Get ADCS mode (hysteresis management done in ADCS application)
+        if DH.data_process_exists("adcs"):
+            adcs_data = DH.get_latest_data("adcs")
+
+            if adcs_data:
+                self.ADCS_MODE = adcs_data[ADCS_IDX.MODE]
+
+                if not (self.ADCS_MODE >= Modes.TUMBLING and self.ADCS_MODE <= Modes.VF_TUMBLING):
+                    self.log_error("ADCS returned an invalid mode, assuming STABLE ADCS mode")
+                    self.ADCS_MODE = Modes.STABLE
+                else:
+                    # Valid mode returned by the ADCS
+                    pass
+            else:
+                self.log_warning("No latest ADCS data available, assuming STABLE ADCS mode")
+                self.ADCS_MODE = Modes.STABLE
+        else:
+            self.log_warning("ADCS task not available, assuming STABLE ADCS mode")
+            self.ADCS_MODE = Modes.STABLE
+
+        # Get EPS mode (hysteresis management done in EPS application)
+        if DH.data_process_exists("eps"):
+            eps_data = DH.get_latest_data("eps")
+
+            if eps_data:
+                self.EPS_MODE = eps_data[EPS_IDX.EPS_POWER_FLAG]
+
+                if not (self.EPS_MODE >= EPS_POWER_FLAG.NONE and self.EPS_MODE <= EPS_POWER_FLAG.NOMINAL):
+                    self.log_error("EPS returned an invalid mode, assuming NOMINAL EPS mode")
+                    self.EPS_MODE = EPS_POWER_FLAG.NOMINAL
+                else:
+                    # Valid mode returned by EPS
+                    pass
+            else:
+                self.log_warning("No latest EPS data available, assuming NOMINAL EPS mode")
+                self.EPS_MODE = EPS_POWER_FLAG.NOMINAL
+        else:
+            self.log_warning("EPS task not available, assuming NOMINAL EPS mode")
+            self.EPS_MODE = EPS_POWER_FLAG.NOMINAL
+
+        # Get PAYLOAD mode
+        if DH.data_process_exists("payload_tm"):
+            payload_data = DH.get_latest_data("payload_tm")
+
+            self.PAYLOAD_MODE = PayloadState.IDLE  # assuming idle if there is no payload data
+
+            if payload_data:
+                self.PAYLOAD_MODE = payload_data[PAYLOAD_IDX.PD_STATE_MAINBOARD]
+
+            # check to see if we have a valid payload mode, if not assume IDLE
+            if not (self.PAYLOAD_MODE >= PayloadState.IDLE and self.PAYLOAD_MODE <= PayloadState.FAIL):
+                self.log_error("PAYLOAD returned an invalid mode, assuming STABLE PAYLOAD mode")
+                self.PAYLOAD_MODE = PayloadState.IDLE
+
+        # ------------------------------------------------------------------------------------------------------------------------------------
+        # DETUMBLING
+        # ------------------------------------------------------------------------------------------------------------------------------------
+
+        if SM.current_state == STATES.DETUMBLING:
+            # Neopixel for DETUMBLING (orange)
+            if SATELLITE.NEOPIXEL_AVAILABLE:
+                SATELLITE.NEOPIXEL.fill([255, 165, 0])
+
+            # Detumbling timeout in case the ADCS is not working
+            if SM.time_since_last_state_change > CONFIG.DETUMBLING_TIMEOUT_DURATION:
+                self.log_info("DETUMBLING timeout - Setting Detumbling Error Flag.")
+                # Set the detumbling error flag in the NVM
+                self.log_data[CDH_IDX.DETUMBLING_ERROR_FLAG] = 1
+
+            # Detumbling impossible due to magnetorquer failure
+            if not any(SATELLITE.TORQUE_DRIVERS_NOT_DEAD(d) for d in ("XP", "XM", "YP", "YM", "ZP", "ZM")):
+                self.log_info("DETUMBLING actuator failure - Setting Detumbling Error Flag.")
+                # Set the detumbling error flag in the NVM
+                self.log_data[CDH_IDX.DETUMBLING_ERROR_FLAG] = 1
+
+            """Transitions out of DETUMBLING"""
+            if (self.ADCS_MODE != Modes.TUMBLING and self.ADCS_MODE != Modes.VF_TUMBLING) or self.log_data[
+                CDH_IDX.DETUMBLING_ERROR_FLAG
+            ] == 1:
+                # T1.1: Spin stabilized OR detumbling error flag is set, transition to NOMINAL
+                self.log_warning("T1.1: Transition from DETUMBLING to NOMINAL")
+                SM.switch_to(STATES.NOMINAL)
+
+            elif self.EPS_MODE == EPS_POWER_FLAG.LOW_POWER:
+                # T1.2: Low SoC, transition to low power
+                self.log_warning("T1.2: Transition from DETUMBLING to LOW POWER")
+                SM.switch_to(STATES.LOW_POWER)
+
+            else:
+                # No transition, stay in DETUMBLING
+                pass
+
+        # ------------------------------------------------------------------------------------------------------------------------------------
+        # NOMINAL
+        # ------------------------------------------------------------------------------------------------------------------------------------
+
+        elif SM.current_state == STATES.NOMINAL:
+            # Neopixel for NOMINAL (green)
+            if SATELLITE.NEOPIXEL_AVAILABLE:
+                SATELLITE.NEOPIXEL.fill([0, 255, 0])
+
+            """Transitions out of NOMINAL"""
+            if (self.ADCS_MODE == Modes.TUMBLING or self.ADCS_MODE == Modes.VF_TUMBLING) and self.log_data[
+                CDH_IDX.DETUMBLING_ERROR_FLAG
+            ] != 1:
+                # T2.1: Tumbling again AND detumbling error flag is not set, transition to DETUMBLING
+                self.log_warning("T2.1: Transition from NOMINAL to DETUMBLING")
+                SM.switch_to(STATES.DETUMBLING)
+
+            elif self.EPS_MODE == EPS_POWER_FLAG.LOW_POWER:
+                # T2.2: Low SoC, transition to low power
+                self.log_warning("T2.2: Transition from NOMINAL to LOW POWER")
+                SM.switch_to(STATES.LOW_POWER)
+
+            elif self.PAYLOAD_MODE == PayloadState.WATCHING:
+                # T2.3: Payload commanded to start watching, transition to EXPERIMENT
+                self.log_warning("T2.3: Transition from NOMINAL to EXPERIMENT")
+                SM.switch_to(STATES.EXPERIMENT)
+            else:
+                # No transition, stay in NOMINAL
+                pass
+
+        # ------------------------------------------------------------------------------------------------------------------------------------
+        # LOW POWER
+        # ------------------------------------------------------------------------------------------------------------------------------------
+
+        elif SM.current_state == STATES.LOW_POWER:
+            # Neopixel for LOW_POWER (red)
+            if SATELLITE.NEOPIXEL_AVAILABLE:
+                SATELLITE.NEOPIXEL.fill([255, 0, 0])
+
+            """Transitions out of LOW_POWER"""
+            if self.EPS_MODE != EPS_POWER_FLAG.LOW_POWER:
+                # T3.1: Nominal or high SoC, transition out of low power
+                self.log_warning("T3.1: Transition from LOW POWER to NOMINAL")
+                SM.switch_to(STATES.NOMINAL)
+
+            else:
+                # No transition, stay in LOW_POWER
+                pass
+
+        # ------------------------------------------------------------------------------------------------------------------------------------
+        # EXPERIMENT
+        # ------------------------------------------------------------------------------------------------------------------------------------
+
+        elif SM.current_state == STATES.EXPERIMENT:
+            # Neopixel for EXPERIMENT (blue)
+            if SATELLITE.NEOPIXEL_AVAILABLE:
+                SATELLITE.NEOPIXEL.fill([100, 100, 255])
+
+            """Transitions out of EXPERIMENT"""
+            if self.PAYLOAD_MODE == PayloadState.FAIL or self.PAYLOAD_MODE == PayloadState.IDLE:
+                # T4.1: Experiment has finished or failed, transition to NOMINAL
+                self.log_warning("T4.1: Transition from EXPERIMENT to NOMINAL")
+                SM.switch_to(STATES.NOMINAL)
+
+            elif self.EPS_MODE == EPS_POWER_FLAG.LOW_POWER:
+                # T4.2: Low SoC, transition to LOW_POWER
+                self.log_warning("T4.2: Transition from EXPERIMENT to LOW POWER")
+                SM.switch_to(STATES.LOW_POWER)
+
+            elif self.ADCS_MODE == Modes.TUMBLING and self.log_data[CDH_IDX.DETUMBLING_ERROR_FLAG] != 1:
+                # T4.3: Tumbling again AND detumbling error flag is not set, transition to DETUMBLING
+                self.log_warning("T4.3: Transition from EXPERIMENT to DETUMBLING")
+                SM.switch_to(STATES.DETUMBLING)
+
+            else:
+                # No transition, stay in EXPERIMENT
+                pass
+
+        # ------------------------------------------------------------------------------------------------------------------------------------
+        # CRITICAL ERROR - UNKNOWN STATE
+        # ------------------------------------------------------------------------------------------------------------------------------------
+
+        else:
+            self.log_error("CRITICAL: Argus is in an unknown state")
+
+        SM.update_time_in_state()
+
+    def command_processor_execution(self):
+        # ------------------------------------------------------------------------------------------------------------------------------------
+        # COMMAND PROCESSOR
+        # ------------------------------------------------------------------------------------------------------------------------------------
+
+        if CommandQueue.command_available():
+            command, queue_error_code = CommandQueue.pop_command()
+            self.log_info(f"Popped command from queue: {command} with status: {queue_error_code}")
+
+            if queue_error_code != QUEUE_STATUS.OK:
+                self.log_error(f"Error popping command from queue: {queue_error_code}")
+                return
+
+            self.log_info(f"  Arguments: {command.arguments}")
+            status, response_args = processor.process_command(command)
+            processor.handle_command_execution_status(status, command.command_id, response_args)
+
+            # Log the command execution history
+            self.log_commands[0] = TPM.time()
+            self.log_commands[1] = command.command_id
+            self.log_commands[2] = status
+            DH.log_data("cmd_logs", self.log_commands)
+
+    async def main_task(self):
+        if SM.current_state == STATES.STARTUP:
+            # Startup sequence
+            self.startup()
+
+        else:
+            # Run command processor
+            self.command_processor_execution()
+
+            # Execute state machine
+            self.state_machine_execution()
+
+            # Set CDH log data
+            self.log_data[CDH_IDX.TIME] = TPM.time()
+            self.log_data[CDH_IDX.BOOT_TIME] = TPM.monotonic() - SATELLITE.BOOTTIME
+            self.log_data[CDH_IDX.SC_STATE] = SM.current_state
+            self.log_data[CDH_IDX.CURRENT_RAM_USAGE] = self.get_memory_usage()
+            self.log_data[CDH_IDX.BOOT_COUNT] = self.boot_count
+            self.log_data[CDH_IDX.DEPLOYMENT_STATUS] = int(self.deployment_done)
+
+            # The detumbling error flag is set in the DETUMBLING state
+
+            # Should always run
+            DH.log_data("cdh", self.log_data)
+
+        # Periodically log to serial
+        self.log_print_counter += 1
+
+        if self.log_print_counter % self.frequency == 0:
+            self.log_print_counter = 0
+
+            self.log_info(f"Time: {TPM.time()}")
+            self.log_info(f"Time since boot: {TPM.monotonic() - SATELLITE.BOOTTIME}")
+            self.log_info(f"GLOBAL STATE: {STR_STATES[SM.current_state]}.")
+            self.log_info(f"RAM USAGE: {self.log_data[CDH_IDX.CURRENT_RAM_USAGE]}%")

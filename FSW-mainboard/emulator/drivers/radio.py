@@ -1,0 +1,129 @@
+import queue
+import random
+import socket
+import time
+
+
+class RadioDebug:
+    def __init__(self, radio):
+        self.radio = radio
+        self.last_tx_packet = None
+
+    def push_rx_queue(self, packet):
+        """Debug function to push a packet into the rx queue (fifo)"""
+        self.radio._rx_queue.put(packet)
+
+    def reset(self):
+        self.clear_rx_queue()
+        self.clear_tx_queue()
+
+    def clear_tx_queue(self):
+        """Debug function to clear the tx queue"""
+        self.radio._tx_queue = queue.Queue()
+
+    def clear_rx_queue(self):
+        """Debug function to clear the rx queue"""
+        self.radio._rx_queue = queue.Queue()
+
+
+class MockAttribute:
+    def __init__(self, value):
+        self.value = value
+
+
+class Radio:
+    def __init__(self, use_socket):
+        self.use_socket = use_socket
+
+        self.node = 0
+        self.listening = False
+
+        self._rx_queue = queue.Queue()
+        self._rx_time_bias = 0.5
+        self._rx_time_dev = 0.3
+
+        self._tx_queue = queue.Queue()
+        self._tx_time_bias = 0.5
+        self._tx_time_dev = 0.3
+
+        self._last_rssi = -147.0
+        self._frequency_error = 123.45
+
+        self.rx_en = MockAttribute(False)  # here just for compatibility reasons
+        self.tx_en = MockAttribute(False)  # here just for compatibility reasons
+
+        self.test = RadioDebug(self)
+
+    def RX_available(self):
+        return not self._rx_queue.empty()
+
+    def read_fifo_buffer(self):
+        if self._rx_queue.empty():
+            return None
+        return self._rx_queue.get()
+
+    def listen(self):
+        self.listening = True
+
+    def receive(self, *, keep_listening=True, with_header=False, with_ack=False, timeout=None, debug=False):
+        rx_time = self._rx_time_bias + (random.random() - 0.5) * self._rx_time_dev
+        time.sleep(rx_time)
+        if self._rx_queue.empty():
+            return None
+        return self._rx_queue.get().observe()
+
+    def rssi(self, raw=True):
+        return self._last_rssi
+
+    def frequency_error(self):
+        return self._frequency_error
+
+    def sleep(self):
+        self.listening = False
+
+    def startReceive(self, timeout=0xFFFFFF):
+        return  # no need to do anything here
+
+    def send(self, packet, destination=0x00, keep_listening=True):
+        if self.use_socket:
+            tx_time = self._tx_time_bias + (random.random() - 0.5) * self._tx_time_dev
+            time.sleep(tx_time)
+            payload = bytearray(len(packet) + 4)
+            payload[0] = destination
+            payload[1] = 0xFF
+            payload[2] = 0x00
+            payload[3] = 0x00
+            payload[4:] = packet
+            self.test.last_tx_packet = payload
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.connect((socket.gethostname(), 5500))
+                    s.sendall(payload)
+                    return 0
+            except Exception as e:
+                print(e)
+                return -1
+        else:
+            tx_time = self._tx_time_bias + (random.random() - 0.5) * self._tx_time_dev
+            time.sleep(tx_time)
+            self.test.last_tx_packet = packet
+        return 0
+
+    async def send_with_ack(self, packet, keep_listening=True):
+        await self.send(packet)
+        return True
+
+    def fifo_empty(self):
+        return True
+
+    def crc_error(self):
+        return 0
+
+    ######################## ERROR HANDLING ########################
+
+    @property
+    def device_errors(self):
+        return []
+
+    def deinit(self):
+        return
